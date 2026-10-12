@@ -195,6 +195,27 @@ drain_events(GstVfmCapSrc *self)
 	return changed;
 }
 
+/* Re-read the device format; if it differs, restart with new caps. */
+static GstFlowReturn
+check_renegotiate(GstVfmCapSrc *self)
+{
+	GstVideoInfo old = self->info;
+
+	if (!query_format(self))
+		return GST_FLOW_ERROR;
+	if (gst_video_info_is_equal(&old, &self->info) &&
+	    old.size == self->info.size)
+		return GST_FLOW_OK;
+
+	GST_INFO_OBJECT(self, "source changed, renegotiating");
+	stream_off(self);
+	if (!gst_base_src_negotiate(GST_BASE_SRC(self)))
+		return GST_FLOW_NOT_NEGOTIATED;
+	if (!stream_on(self))
+		return GST_FLOW_ERROR;
+	return GST_FLOW_OK;
+}
+
 static gboolean
 gst_vfmcap_src_start(GstBaseSrc *bsrc)
 {
@@ -305,6 +326,7 @@ gst_vfmcap_src_create(GstPushSrc *psrc, GstBuffer **outbuf)
 		return GST_FLOW_ERROR;
 
 	for (;;) {
+		gboolean recheck = FALSE;
 		int r;
 
 		if (self->flushing)
@@ -318,19 +340,13 @@ gst_vfmcap_src_create(GstPushSrc *psrc, GstBuffer **outbuf)
 		if (r <= 0)
 			continue;
 
-		if ((pfd.revents & POLLPRI) && drain_events(self)) {
-			GstVideoInfo old = self->info;
+		if (pfd.revents & POLLPRI)
+			recheck = drain_events(self);
+		if (recheck) {
+			GstFlowReturn ret = check_renegotiate(self);
 
-			if (query_format(self) &&
-			    !gst_video_info_is_equal(&old, &self->info)) {
-				GST_INFO_OBJECT(self, "source changed, renegotiating");
-				stream_off(self);
-				if (!gst_base_src_negotiate(GST_BASE_SRC(self)))
-					return GST_FLOW_NOT_NEGOTIATED;
-				if (!stream_on(self))
-					return GST_FLOW_ERROR;
-				continue;
-			}
+			if (ret != GST_FLOW_OK)
+				return ret;
 		}
 		if (!(pfd.revents & POLLIN))
 			continue;
@@ -362,10 +378,16 @@ gst_vfmcap_src_create(GstPushSrc *psrc, GstBuffer **outbuf)
 			GST_DEBUG_OBJECT(self, "no dmabuf for token %u", buf.index);
 			continue;
 		}
-		if (req.size < self->info.size) {
-			GST_WARNING_OBJECT(self, "short frame %u < %zu, dropped",
+		if (req.size != self->info.size) {
+			GstFlowReturn ret;
+
+			/* format changed without (or ahead of) SOURCE_CHANGE */
+			GST_DEBUG_OBJECT(self, "frame size %u, expected %zu",
 				req.size, self->info.size);
 			close(req.fd);
+			ret = check_renegotiate(self);
+			if (ret != GST_FLOW_OK)
+				return ret;
 			continue;
 		}
 		break;
