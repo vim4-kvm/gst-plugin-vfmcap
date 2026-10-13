@@ -24,3 +24,9 @@ gst-launch-1.0 vfmcapsrc ! queue ! amlvenc bitrate=8000 ! video/x-h264 ! h264par
 | `device` | `/dev/video_cap` | vfm_cap device node |
 
 On a source change (resolution/format) the element renegotiates caps. Timestamps are taken from the pipeline clock at dequeue time; caps carry `framerate=0/1` since the rate follows the HDMI source.
+
+For temporary diagnostics, set `VIM4_VIDEO_TIMING=1 GST_DEBUG=vfmcapsrc:4`.
+`delivery_to_dequeue_ms` compares the kernel's V4L2 delivery timestamp with
+`CLOCK_MONOTONIC` immediately after DQBUF. It measures pending delivery, not HDMI
+exposure or scanout latency. `sequence` is the consumer's delivery sequence.
+Disabled by default; remove these variables after measuring to avoid logging overhead.

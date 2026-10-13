@@ -19,6 +19,7 @@
 #include <poll.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <time.h>
 #include <unistd.h>
 #include <linux/videodev2.h>
 
@@ -46,6 +47,7 @@ struct _GstVfmCapSrc {
 	gint fd;
 	gboolean streaming;
 	gboolean flushing;
+	gboolean timing;
 
 	GstAllocator *allocator;
 	GstVideoInfo info;
@@ -364,6 +366,19 @@ gst_vfmcap_src_create(GstPushSrc *psrc, GstBuffer **outbuf)
 				("DQBUF: %s", g_strerror(errno)));
 			return GST_FLOW_ERROR;
 		}
+		if (self->timing && (buf.timestamp.tv_sec || buf.timestamp.tv_usec)) {
+			struct timespec now;
+			/* vfm_cap timestamps delivery with ktime_get_ns(), not exposure.
+			 * CLOCK_MONOTONIC measures how long this token waited for dequeue. */
+			if (clock_gettime(CLOCK_MONOTONIC, &now) == 0) {
+				gint64 elapsed = (gint64)now.tv_sec * G_GINT64_CONSTANT(1000000000) + now.tv_nsec
+					- (gint64)buf.timestamp.tv_sec * G_GINT64_CONSTANT(1000000000)
+					- (gint64)buf.timestamp.tv_usec * 1000;
+				if (elapsed >= 0)
+					GST_INFO_OBJECT(self, "VIM4 timing delivery_to_dequeue_ms=%.3f sequence=%u",
+						(double)elapsed / 1000000.0, buf.sequence);
+			}
+		}
 
 		memset(&req, 0, sizeof(req));
 		req.index = buf.index;
@@ -494,6 +509,7 @@ gst_vfmcap_src_init(GstVfmCapSrc *self)
 {
 	self->device = g_strdup(DEFAULT_DEVICE);
 	self->fd = -1;
+	self->timing = g_strcmp0(g_getenv("VIM4_VIDEO_TIMING"), "1") == 0;
 	gst_base_src_set_live(GST_BASE_SRC(self), TRUE);
 	gst_base_src_set_format(GST_BASE_SRC(self), GST_FORMAT_TIME);
 	gst_base_src_set_do_timestamp(GST_BASE_SRC(self), FALSE);
