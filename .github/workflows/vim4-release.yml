@@ -1,0 +1,24 @@
+name: VIM4 release
+on:
+  push:
+    branches: [main]
+    tags: ['release-*']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Publish a verified package release
+        type: boolean
+        default: false
+permissions:
+  contents: read
+jobs:
+  build:
+    uses: vim4-kvm/vim4-kvm/.github/workflows/release-component.yml@main
+    permissions:
+      contents: write
+    with:
+      repository: gst-plugin-vfmcap
+      component: capture
+      publish: ${{ startsWith(github.ref, 'refs/tags/release-') || inputs.publish == true }}
