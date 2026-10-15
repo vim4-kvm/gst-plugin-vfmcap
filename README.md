@@ -30,3 +30,7 @@ For temporary diagnostics, set `VIM4_VIDEO_TIMING=1 GST_DEBUG=vfmcapsrc:4`.
 `CLOCK_MONOTONIC` immediately after DQBUF. It measures pending delivery, not HDMI
 exposure or scanout latency. `sequence` is the consumer's delivery sequence.
 Disabled by default; remove these variables after measuring to avoid logging overhead.
+
+## License
+
+[LGPL-2.1-or-later](LICENSE), matching the GStreamer plugin declaration.
