@@ -25,3 +25,8 @@ library('gstvfmcap', 'src/gstvfmcapsrc.c',
 
 test('vuy24-repack', executable('test-vuy24', 'tests/test-vuy24.c',
   include_directories : include_directories('src')))
+
+# Requires an exclusively owned board and a physical HDMI test pattern;
+# deliberately not registered as an automatic Meson test.
+executable('capture-integrity', 'tests/capture-integrity.c',
+  dependencies : [deps, dependency('gstreamer-app-1.0')])

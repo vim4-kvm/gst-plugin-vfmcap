@@ -19,11 +19,12 @@ YUV444 requires the driver's `VUY3` extension and `no_swap_en=1`. VDIN writes
 Cr-Cb-Y bytes; the source reorders them into standard GStreamer `v308` (Y-Cb-Cr)
 system-memory buffers, preserving every chroma sample. This path copies each
 frame and uses ARM64 NEON when available; NV21/NV12/UYVY remain zero-copy.
+Use the driver with cacheable read-only DMA mappings and CPU access callbacks:
+cache invalidation runs once per immutable frame export, and the source fuses
+copying/reordering into reusable output buffers. The earlier write-combine
+mapping is functionally compatible but too slow for full-frame CPU processing.
 Capture support does not imply that `amlvenc` can encode 4:4:4. Keep NV21 for
 existing KVM applications until their complete encoding path supports 4:4:4.
-On the VIM4 development board, a release build delivered 300 4K `v308` frames
-to fakesink in 22.70 seconds (about 13.2 fps). The uncached DMA read and CPU
-repacking path is functional, but is not a 4K60 application pipeline.
 
 For an exclusive diagnostic pipeline, configure the board HDMI service with
 `HDMI_CAPTURE_FORMAT=YUV444`, then use:
@@ -34,6 +35,18 @@ gst-launch-1.0 vfmcapsrc ! video/x-raw,format=v308 ! fakesink sync=false
 
 The capture setting affects all consumers and requires restarting the HDMI
 service. Restore `HDMI_CAPTURE_FORMAT=NV21` before restarting existing KVM apps.
+
+## Hardware regression
+
+Build `tests/capture-pattern.swift` with `swiftc` on the Mac supplying HDMI and
+run it on a physical 3840×2160 display with 1920×1080 HiDPI scaling. It displays
+dynamic frame IDs at three heights and single-pixel chroma stripes, then exits
+after 240 seconds. With exclusive board access and YUV444 configured, run the
+Meson-built `capture-integrity /dev/video_cap 3600 last-frame.raw`. After 120
+warm-up frames it checks every output frame for checksum failures, tearing,
+repeated/skipped IDs and horizontal/vertical chroma preservation. A failure
+returns nonzero; source/display cadence can also cause repeated/skipped IDs.
+This tests the complete capture/repack path to appsink, not encoding/network.
 
 ```sh
 gst-launch-1.0 vfmcapsrc ! queue ! amlvenc bitrate=8000 ! video/x-h264 ! h264parse ! mp4mux ! filesink location=cap.mp4

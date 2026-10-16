@@ -56,6 +56,7 @@ struct _GstVfmCapSrc {
 	gboolean repack_vuy24;
 
 	GstAllocator *allocator;
+	GstBufferPool *repack_pool;
 	GstVideoInfo info;
 	gboolean info_valid;
 	guint64 frames;
@@ -127,6 +128,21 @@ query_format(GstVfmCapSrc *self)
 		self->info.offset[1] = (gsize)self->info.stride[0] * mp->height;
 	}
 	self->info.size = mp->plane_fmt[0].sizeimage;
+	if (self->repack_pool) {
+		gst_buffer_pool_set_active(self->repack_pool, FALSE);
+		gst_clear_object(&self->repack_pool);
+	}
+	if (self->repack_vuy24) {
+		GstStructure *config;
+		self->repack_pool = gst_buffer_pool_new();
+		config = gst_buffer_pool_get_config(self->repack_pool);
+		/* Reuse touched pages instead of allocating/zeroing 25 MB per frame.
+		 * No maximum: downstream holding a buffer must not deadlock stop. */
+		gst_buffer_pool_config_set_params(config, NULL, self->info.size, 2, 0);
+		if (!gst_buffer_pool_set_config(self->repack_pool, config) ||
+		    !gst_buffer_pool_set_active(self->repack_pool, TRUE))
+			return FALSE;
+	}
 	self->info_valid = TRUE;
 	GST_INFO_OBJECT(self, "format %s %ux%u size %u",
 		gst_video_format_to_string(vfmt), mp->width, mp->height,
@@ -264,6 +280,10 @@ gst_vfmcap_src_stop(GstBaseSrc *bsrc)
 		close(self->fd);
 	self->fd = -1;
 	gst_clear_object(&self->allocator);
+	if (self->repack_pool) {
+		gst_buffer_pool_set_active(self->repack_pool, FALSE);
+		gst_clear_object(&self->repack_pool);
+	}
 	return TRUE;
 }
 
@@ -431,24 +451,24 @@ gst_vfmcap_src_create(GstPushSrc *psrc, GstBuffer **outbuf)
 	gst_buffer_append_memory(gbuf, mem);
 	if (self->repack_vuy24) {
 		GstMapInfo input = GST_MAP_INFO_INIT, output = GST_MAP_INFO_INIT;
-		GstBuffer *converted = gst_buffer_new_allocate(NULL, self->info.size, NULL);
+		GstBuffer *converted = NULL;
+		GstFlowReturn acquired = gst_buffer_pool_acquire_buffer(self->repack_pool, &converted, NULL);
 		struct dma_buf_sync sync = { .flags = DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ };
 		gboolean synced = ioctl(req.fd, DMA_BUF_IOCTL_SYNC, &sync) == 0;
-		gboolean ok = synced && gst_buffer_map(gbuf, &input, GST_MAP_READ) &&
+		gboolean ok = acquired == GST_FLOW_OK && synced && gst_buffer_map(gbuf, &input, GST_MAP_READ) &&
 			converted && gst_buffer_map(converted, &output, GST_MAP_WRITE);
 
 		if (ok) {
 			gsize row_bytes = GST_VIDEO_INFO_WIDTH(&self->info) * 3;
 			gsize height = GST_VIDEO_INFO_HEIGHT(&self->info);
 			gsize stride = self->info.stride[0];
-			/* VDIN mappings are write-combined, not cached. Bulk copy before
-			 * interleaved NEON loads, which are costly on this mapping. */
-			memcpy(output.data, input.data, height * stride);
 			/* Initialize only padding, avoiding an extra full-frame write. */
 			for (gsize y = 0; y < height; y++)
 				memset(output.data + y * stride + row_bytes, 0, stride - row_bytes);
 			memset(output.data + height * stride, 0, output.size - height * stride);
-			vuy24_to_v308(output.data, output.data,
+			/* The driver's read-only cacheable mapping is synchronized above.
+			 * Fuse the copy and channel reorder into one memory pass. */
+			vuy24_to_v308(output.data, input.data,
 				GST_VIDEO_INFO_WIDTH(&self->info),
 				GST_VIDEO_INFO_HEIGHT(&self->info), self->info.stride[0]);
 		}
