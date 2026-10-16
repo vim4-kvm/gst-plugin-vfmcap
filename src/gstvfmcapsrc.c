@@ -22,6 +22,7 @@
 #include <time.h>
 #include <unistd.h>
 #include <linux/videodev2.h>
+#include <linux/dma-buf.h>
 
 #include <gst/gst.h>
 #include <gst/base/gstpushsrc.h>
@@ -29,6 +30,10 @@
 #include <gst/allocators/gstdmabuf.h>
 
 #include "vfmcap-uapi.h"
+#include "vuy24.h"
+
+/* vfm_cap extension: VDIN's packed Cr-Cb-Y output with no_swap_en=1. */
+#define V4L2_PIX_FMT_AML_VUY24 v4l2_fourcc('V', 'U', 'Y', '3')
 
 GST_DEBUG_CATEGORY_STATIC(vfmcapsrc_debug);
 #define GST_CAT_DEFAULT vfmcapsrc_debug
@@ -48,6 +53,7 @@ struct _GstVfmCapSrc {
 	gboolean streaming;
 	gboolean flushing;
 	gboolean timing;
+	gboolean repack_vuy24;
 
 	GstAllocator *allocator;
 	GstVideoInfo info;
@@ -62,7 +68,7 @@ enum {
 
 static GstStaticPadTemplate src_template = GST_STATIC_PAD_TEMPLATE("src",
 	GST_PAD_SRC, GST_PAD_ALWAYS,
-	GST_STATIC_CAPS(GST_VIDEO_CAPS_MAKE("{ NV21, NV12, UYVY }")));
+	GST_STATIC_CAPS(GST_VIDEO_CAPS_MAKE("{ NV21, NV12, UYVY, v308 }")));
 
 G_DEFINE_TYPE(GstVfmCapSrc, gst_vfmcap_src, GST_TYPE_PUSH_SRC);
 
@@ -76,6 +82,8 @@ fourcc_to_format(guint32 fourcc)
 		return GST_VIDEO_FORMAT_NV12;
 	case V4L2_PIX_FMT_UYVY:
 		return GST_VIDEO_FORMAT_UYVY;
+	case V4L2_PIX_FMT_AML_VUY24:
+		return GST_VIDEO_FORMAT_v308;
 	default:
 		return GST_VIDEO_FORMAT_UNKNOWN;
 	}
@@ -98,11 +106,20 @@ query_format(GstVfmCapSrc *self)
 		GST_ELEMENT_ERROR(self, STREAM, FORMAT,
 			("Unsupported vfm_cap format %" GST_FOURCC_FORMAT,
 			 GST_FOURCC_ARGS(mp->pixelformat)),
-			("Configure vdin for 8-bit NV21/NV12/UYVY output"));
+			("Configure vdin for 8-bit NV21/NV12/UYVY/YUV444 output"));
 		return FALSE;
 	}
 
 	gst_video_info_set_format(&self->info, vfmt, mp->width, mp->height);
+	self->repack_vuy24 = mp->pixelformat == V4L2_PIX_FMT_AML_VUY24;
+	if (self->repack_vuy24 &&
+	    (mp->plane_fmt[0].bytesperline < (guint64)mp->width * 3 ||
+	     mp->plane_fmt[0].sizeimage <
+	     (guint64)mp->plane_fmt[0].bytesperline * mp->height)) {
+		GST_ELEMENT_ERROR(self, STREAM, FORMAT,
+			("Invalid VUY24 stride or buffer size"), (NULL));
+		return FALSE;
+	}
 	/* vdin writes planes back to back with stride == width */
 	self->info.stride[0] = mp->plane_fmt[0].bytesperline;
 	if (GST_VIDEO_INFO_N_PLANES(&self->info) == 2) {
@@ -412,6 +429,48 @@ gst_vfmcap_src_create(GstPushSrc *psrc, GstBuffer **outbuf)
 	gst_memory_resize(mem, 0, self->info.size);
 	gbuf = gst_buffer_new();
 	gst_buffer_append_memory(gbuf, mem);
+	if (self->repack_vuy24) {
+		GstMapInfo input = GST_MAP_INFO_INIT, output = GST_MAP_INFO_INIT;
+		GstBuffer *converted = gst_buffer_new_allocate(NULL, self->info.size, NULL);
+		struct dma_buf_sync sync = { .flags = DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ };
+		gboolean synced = ioctl(req.fd, DMA_BUF_IOCTL_SYNC, &sync) == 0;
+		gboolean ok = synced && gst_buffer_map(gbuf, &input, GST_MAP_READ) &&
+			converted && gst_buffer_map(converted, &output, GST_MAP_WRITE);
+
+		if (ok) {
+			gsize row_bytes = GST_VIDEO_INFO_WIDTH(&self->info) * 3;
+			gsize height = GST_VIDEO_INFO_HEIGHT(&self->info);
+			gsize stride = self->info.stride[0];
+			/* VDIN mappings are write-combined, not cached. Bulk copy before
+			 * interleaved NEON loads, which are costly on this mapping. */
+			memcpy(output.data, input.data, height * stride);
+			/* Initialize only padding, avoiding an extra full-frame write. */
+			for (gsize y = 0; y < height; y++)
+				memset(output.data + y * stride + row_bytes, 0, stride - row_bytes);
+			memset(output.data + height * stride, 0, output.size - height * stride);
+			vuy24_to_v308(output.data, output.data,
+				GST_VIDEO_INFO_WIDTH(&self->info),
+				GST_VIDEO_INFO_HEIGHT(&self->info), self->info.stride[0]);
+		}
+		if (output.data)
+			gst_buffer_unmap(converted, &output);
+		if (input.data)
+			gst_buffer_unmap(gbuf, &input);
+		if (synced) {
+			sync.flags = DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ;
+			if (ioctl(req.fd, DMA_BUF_IOCTL_SYNC, &sync) < 0)
+				ok = FALSE;
+		}
+		gst_buffer_unref(gbuf);
+		if (!ok) {
+			if (converted)
+				gst_buffer_unref(converted);
+			GST_ELEMENT_ERROR(self, RESOURCE, READ,
+				("Cannot map or synchronize VUY24 frame"), (NULL));
+			return GST_FLOW_ERROR;
+		}
+		gbuf = converted;
+	}
 	gst_buffer_add_video_meta_full(gbuf, GST_VIDEO_FRAME_FLAG_NONE,
 		GST_VIDEO_INFO_FORMAT(&self->info),
 		GST_VIDEO_INFO_WIDTH(&self->info),

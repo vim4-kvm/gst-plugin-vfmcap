@@ -22,3 +22,6 @@ library('gstvfmcap', 'src/gstvfmcapsrc.c',
   dependencies : deps,
   install : true,
   install_dir : gst_dep.get_variable('pluginsdir'))
+
+test('vuy24-repack', executable('test-vuy24', 'tests/test-vuy24.c',
+  include_directories : include_directories('src')))
