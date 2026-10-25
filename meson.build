@@ -18,13 +18,17 @@ add_project_arguments(
   '-Wno-missing-field-initializers',
   language : 'c')
 
-library('gstvfmcap', 'src/gstvfmcapsrc.c',
+library('gstvfmcap', ['src/gstvfmcapsrc.c', 'src/gstvim4vdin1src.c'],
   dependencies : deps,
   install : true,
   install_dir : gst_dep.get_variable('pluginsdir'))
 
 test('vuy24-repack', executable('test-vuy24', 'tests/test-vuy24.c',
   include_directories : include_directories('src')))
+
+test('vdin1-capture', executable('test-vdin1',
+  ['tests/test-vdin1.c', 'src/gstvim4vdin1src.c'],
+  dependencies : deps, include_directories : include_directories('src')))
 
 # Requires an exclusively owned board and a physical HDMI test pattern;
 # deliberately not registered as an automatic Meson test.

@@ -4,6 +4,17 @@ GStreamer source `vfmcapsrc` for the `vfm_cap` V4L2 device ([vim4-kvm/common_dri
 
 Frames are exported as DMA-buf straight from the vdin capture buffers and pushed downstream without copies, so a hardware encoder (`amlvenc`) can consume them directly.
 
+The same plugin provides `vim4vdin1src` for the native-HDR 5.15 runtime:
+VDIN0 retains the display's HDR stream while VDIN1 captures independent NV21 SDR
+from the same HDMI receiver. The board launcher sets `VIM4_SECONDARY_HDMI_CAPTURE=1`
+and selects the private **standard** `video4linux2` plugin; the system vendor
+replacement must not be used because it closes the primary HDMI receiver.
+`vim4vdin1src` reads HDMI geometry on startup, exports DMA buffers with VideoMeta,
+and reserves enough buffers for concurrent encoder/JPEG branches. `height=0`
+keeps the input size; a smaller height requests VDIN1 hardware scaling, preserving
+aspect ratio. `num-buffers` supports one-frame snapshots. It refuses to start
+without the explicit runtime flag: stock `/dev/video71` is display writeback.
+
 ## Build
 
 ```sh

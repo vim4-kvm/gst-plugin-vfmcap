@@ -31,6 +31,7 @@
 
 #include "vfmcap-uapi.h"
 #include "vuy24.h"
+#include "vdin1.h"
 
 /* vfm_cap extension: VDIN's packed Cr-Cb-Y output with no_swap_en=1. */
 #define V4L2_PIX_FMT_AML_VUY24 v4l2_fourcc('V', 'U', 'Y', '3')
@@ -600,7 +601,9 @@ plugin_init(GstPlugin *plugin)
 	GST_DEBUG_CATEGORY_INIT(vfmcapsrc_debug, "vfmcapsrc", 0,
 				"vfm_cap source");
 	return gst_element_register(plugin, "vfmcapsrc", GST_RANK_NONE,
-				    GST_TYPE_VFMCAP_SRC);
+				    GST_TYPE_VFMCAP_SRC) &&
+		gst_element_register(plugin, "vim4vdin1src", GST_RANK_NONE,
+				     gst_vim4_vdin1_src_get_type());
 }
 
 GST_PLUGIN_DEFINE(GST_VERSION_MAJOR, GST_VERSION_MINOR, vfmcap,
