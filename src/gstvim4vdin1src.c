@@ -15,17 +15,28 @@ enum { PROP_0, PROP_HEIGHT, PROP_NUM_BUFFERS };
 
 GstCaps *vim4_vdin1_caps(const gchar *input_info, guint output_height)
 {
-    guint width = 0, height = 0, rate = 0;
+    guint width = 0, height = 0, rate = 0, capture_rate = 0;
+    gboolean has_capture_rate = FALSE;
     gchar **lines = g_strsplit(input_info, "\n", -1);
     for (gchar **line = lines; *line; ++line) {
         if (sscanf(*line, " Hactive: %u", &width) == 1) continue;
         if (sscanf(*line, " Vactive: %u", &height) == 1) continue;
+        if (sscanf(*line, " Capture Frame Rate: %u", &capture_rate) == 1) {
+            has_capture_rate = TRUE;
+            continue;
+        }
         sscanf(*line, " Frame Rate: %u", &rate);
     }
     g_strfreev(lines);
     if (width < 16 || width > 4096 || height < 16 || height > 2160 ||
         rate < 100 || rate > 12000)
         return NULL;
+    /* VRR changes delivery intervals, not the capture/encoder allocation. */
+    if (has_capture_rate) {
+        if (capture_rate < 100 || capture_rate > 12000)
+            return NULL;
+        rate = capture_rate;
+    }
     if (output_height && output_height < height) {
         width = ((guint64)width * output_height / height) & ~1u;
         height = output_height & ~1u;

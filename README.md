@@ -15,6 +15,11 @@ keeps the input size; a smaller height requests VDIN1 hardware scaling, preservi
 aspect ratio. `num-buffers` supports one-frame snapshots. It refuses to start
 without the explicit runtime flag: stock `/dev/video71` is display writeback.
 
+On receivers exposing `Capture Frame Rate`, VDIN1 caps use that stable base
+budget during VRR; the measured `Frame Rate` remains the fallback for older
+kernels. An explicitly unknown base rate is rejected. This does not pace or
+duplicate frames, advertise VRR through EDID, or qualify hardware VRR support.
+
 ## Build
 
 ```sh

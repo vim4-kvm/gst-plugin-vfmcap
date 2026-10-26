@@ -50,11 +50,28 @@ static void dma_allocation(void)
     gst_object_unref(capture);
 }
 
+static void variable_cadence(void)
+{
+    for (guint rate = 4800; rate <= 12000; rate += 100) {
+        gchar *text = g_strdup_printf("Hactive: 1920\nVactive: 1080\nFrame Rate: %u\nCapture Frame Rate: 12000\n", rate);
+        GstCaps *caps = vim4_vdin1_caps(text, 0);
+        GstVideoInfo info;
+        g_assert_nonnull(caps);
+        g_assert_true(gst_video_info_from_caps(&info, caps));
+        g_assert_cmpint(info.fps_n, ==, 120);
+        gst_caps_unref(caps);
+        g_free(text);
+    }
+    g_assert_null(vim4_vdin1_caps("Hactive: 1920\nVactive: 1080\nFrame Rate: 4800\nCapture Frame Rate: 0\n", 0));
+    g_assert_null(vim4_vdin1_caps("Hactive: 1920\nVactive: 1080\nFrame Rate: 0\nCapture Frame Rate: 12000\n", 0));
+}
+
 int main(int argc, char **argv)
 {
     gst_init(&argc, &argv);
     g_test_init(&argc, &argv, NULL);
     g_test_add_func("/vdin1/geometry", geometry);
     g_test_add_func("/vdin1/dma-allocation", dma_allocation);
+    g_test_add_func("/vdin1/variable-cadence", variable_cadence);
     return g_test_run();
 }
