@@ -35,7 +35,7 @@ vdin0 must write NV21/NV12/UYVY, YUV444 or packed ten-bit `AMLY`, and `vfm_cap`
 must be in the vfm `tvpath` after `vdin0`. See the `vim4-kvm` repo `tools/hdmi-setup.sh`.
 
 The native-HDR T7 configuration uses full-packed 4:2:2 and `no_swap_en=1`.
-`AMLY` conversion reverses each 128-bit word, unpacks Y-Cr-Y-Cb ten-bit samples,
+`AMLY` conversion unpacks little-endian Cb-Y-Cr-Y ten-bit slots (five bytes per pair),
 then vertically averages chroma into reusable P010 system-memory buffers.
 ARM64 NEON processes complete 32-pixel blocks; the scalar tail preserves padded
 rows. This path copies raw frames and requires cacheable read-only DMA mappings
