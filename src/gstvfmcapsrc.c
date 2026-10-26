@@ -31,10 +31,12 @@
 
 #include "vfmcap-uapi.h"
 #include "vuy24.h"
+#include "amly.h"
 #include "vdin1.h"
 
 /* vfm_cap extension: VDIN's packed Cr-Cb-Y output with no_swap_en=1. */
 #define V4L2_PIX_FMT_AML_VUY24 v4l2_fourcc('V', 'U', 'Y', '3')
+#define V4L2_PIX_FMT_AMLY v4l2_fourcc('A', 'M', 'L', 'Y')
 
 GST_DEBUG_CATEGORY_STATIC(vfmcapsrc_debug);
 #define GST_CAT_DEFAULT vfmcapsrc_debug
@@ -55,13 +57,70 @@ struct _GstVfmCapSrc {
 	gboolean flushing;
 	gboolean timing;
 	gboolean repack_vuy24;
+	gboolean repack_amly;
+	guint input_size;
+	guint input_stride;
 
 	GstAllocator *allocator;
 	GstBufferPool *repack_pool;
+	GThreadPool *repack_worker;
 	GstVideoInfo info;
 	gboolean info_valid;
 	guint64 frames;
 };
+
+typedef struct {
+	uint16_t *y, *uv;
+	const uint8_t *src;
+	gsize width, height, input_stride, output_stride;
+	GMutex mutex;
+	GCond complete;
+	gboolean done;
+} AmlyJob;
+
+static void amly_worker(gpointer data, gpointer unused)
+{
+	AmlyJob *job = data;
+	amly_to_p010(job->y, job->uv, job->src, job->width, job->height,
+		job->input_stride, job->output_stride);
+	g_mutex_lock(&job->mutex);
+	job->done = TRUE;
+	g_cond_signal(&job->complete);
+	g_mutex_unlock(&job->mutex);
+}
+
+static void repack_amly(GstVfmCapSrc *self, uint8_t *output, const uint8_t *input)
+{
+	gsize width = GST_VIDEO_INFO_WIDTH(&self->info);
+	gsize height = GST_VIDEO_INFO_HEIGHT(&self->info);
+	gsize stride = self->info.stride[0] / 2;
+	/* Split on a pair of rows so chroma averaging never crosses workers.
+	 * Both halves finish before releasing the immutable DMA mapping. */
+	gsize split = self->repack_worker && height >= 1080 ? (height / 2) & ~(gsize)1 : 0;
+	AmlyJob job = { .y = (uint16_t *)output,
+		.uv = (uint16_t *)(output + self->info.offset[1]), .src = input,
+		.width = width, .height = split, .input_stride = self->input_stride,
+		.output_stride = stride };
+	if (split) {
+		g_mutex_init(&job.mutex);
+		g_cond_init(&job.complete);
+		if (!g_thread_pool_push(self->repack_worker, &job, NULL))
+			split = 0;
+	}
+	amly_to_p010(job.y + split * stride, job.uv + split / 2 * stride,
+		input + split * self->input_stride, width, height - split,
+		self->input_stride, stride);
+	if (job.height) {
+		if (split) {
+			g_mutex_lock(&job.mutex);
+			while (!job.done)
+				g_cond_wait(&job.complete, &job.mutex);
+			g_mutex_unlock(&job.mutex);
+		}
+		g_cond_clear(&job.complete);
+		g_mutex_clear(&job.mutex);
+	}
+}
 
 enum {
 	PROP_0,
@@ -70,7 +129,7 @@ enum {
 
 static GstStaticPadTemplate src_template = GST_STATIC_PAD_TEMPLATE("src",
 	GST_PAD_SRC, GST_PAD_ALWAYS,
-	GST_STATIC_CAPS(GST_VIDEO_CAPS_MAKE("{ NV21, NV12, UYVY, v308 }")));
+	GST_STATIC_CAPS(GST_VIDEO_CAPS_MAKE("{ NV21, NV12, UYVY, v308, P010_10LE }")));
 
 G_DEFINE_TYPE(GstVfmCapSrc, gst_vfmcap_src, GST_TYPE_PUSH_SRC);
 
@@ -86,6 +145,8 @@ fourcc_to_format(guint32 fourcc)
 		return GST_VIDEO_FORMAT_UYVY;
 	case V4L2_PIX_FMT_AML_VUY24:
 		return GST_VIDEO_FORMAT_v308;
+	case V4L2_PIX_FMT_AMLY:
+		return GST_VIDEO_FORMAT_P010_10LE;
 	default:
 		return GST_VIDEO_FORMAT_UNKNOWN;
 	}
@@ -114,6 +175,17 @@ query_format(GstVfmCapSrc *self)
 
 	gst_video_info_set_format(&self->info, vfmt, mp->width, mp->height);
 	self->repack_vuy24 = mp->pixelformat == V4L2_PIX_FMT_AML_VUY24;
+	self->repack_amly = mp->pixelformat == V4L2_PIX_FMT_AMLY;
+	self->input_size = mp->plane_fmt[0].sizeimage;
+	self->input_stride = mp->plane_fmt[0].bytesperline;
+	if (self->repack_amly && (mp->width % 2 || mp->height % 2 ||
+	    self->input_stride % 16 ||
+	    self->input_stride < (((guint64)mp->width * 5 / 2 + 15) & ~(guint64)15) ||
+	    self->input_size < (guint64)self->input_stride * mp->height)) {
+		GST_ELEMENT_ERROR(self, STREAM, FORMAT,
+			("Invalid packed 10-bit frame geometry"), (NULL));
+		return FALSE;
+	}
 	if (self->repack_vuy24 &&
 	    (mp->plane_fmt[0].bytesperline < (guint64)mp->width * 3 ||
 	     mp->plane_fmt[0].sizeimage <
@@ -123,18 +195,36 @@ query_format(GstVfmCapSrc *self)
 		return FALSE;
 	}
 	/* vdin writes planes back to back with stride == width */
-	self->info.stride[0] = mp->plane_fmt[0].bytesperline;
-	if (GST_VIDEO_INFO_N_PLANES(&self->info) == 2) {
+	if (!self->repack_amly)
+		self->info.stride[0] = mp->plane_fmt[0].bytesperline;
+	if (!self->repack_amly && GST_VIDEO_INFO_N_PLANES(&self->info) == 2) {
 		self->info.stride[1] = self->info.stride[0];
 		self->info.offset[1] = (gsize)self->info.stride[0] * mp->height;
 	}
-	self->info.size = mp->plane_fmt[0].sizeimage;
+	if (!self->repack_amly)
+		self->info.size = mp->plane_fmt[0].sizeimage;
+	if (mp->colorspace == V4L2_COLORSPACE_REC709)
+		gst_video_colorimetry_from_string(&self->info.colorimetry, "bt709");
+	if (mp->colorspace == V4L2_COLORSPACE_BT2020 && mp->xfer_func != V4L2_XFER_FUNC_SMPTE2084) {
+		GST_ELEMENT_ERROR(self, STREAM, FORMAT,
+			("Native BT.2020 capture currently requires PQ transfer"), (NULL));
+		return FALSE;
+	}
+	if (mp->colorspace == V4L2_COLORSPACE_BT2020 && mp->xfer_func == V4L2_XFER_FUNC_SMPTE2084) {
+		/* Resolve the transfer enum in the runtime: vendor GStreamer has an
+		 * extra enum entry that changes the numeric value of SMPTE2084. */
+		gst_video_colorimetry_from_string(&self->info.colorimetry, "bt2100-pq");
+		self->info.colorimetry.range = mp->quantization == V4L2_QUANTIZATION_FULL_RANGE ?
+			GST_VIDEO_COLOR_RANGE_0_255 : GST_VIDEO_COLOR_RANGE_16_235;
+	}
 	if (self->repack_pool) {
 		gst_buffer_pool_set_active(self->repack_pool, FALSE);
 		gst_clear_object(&self->repack_pool);
 	}
-	if (self->repack_vuy24) {
+	if (self->repack_vuy24 || self->repack_amly) {
 		GstStructure *config;
+		if (self->repack_amly && !self->repack_worker)
+			self->repack_worker = g_thread_pool_new(amly_worker, NULL, 1, FALSE, NULL);
 		self->repack_pool = gst_buffer_pool_new();
 		config = gst_buffer_pool_get_config(self->repack_pool);
 		/* Reuse touched pages instead of allocating/zeroing 25 MB per frame.
@@ -431,12 +521,12 @@ gst_vfmcap_src_create(GstPushSrc *psrc, GstBuffer **outbuf)
 			GST_DEBUG_OBJECT(self, "no dmabuf for token %u", buf.index);
 			continue;
 		}
-		if (req.size != self->info.size) {
+		if (req.size != self->input_size) {
 			GstFlowReturn ret;
 
 			/* format changed without (or ahead of) SOURCE_CHANGE */
 			GST_DEBUG_OBJECT(self, "frame size %u, expected %zu",
-				req.size, self->info.size);
+				req.size, (gsize)self->input_size);
 			close(req.fd);
 			ret = check_renegotiate(self);
 			if (ret != GST_FLOW_OK)
@@ -447,10 +537,11 @@ gst_vfmcap_src_create(GstPushSrc *psrc, GstBuffer **outbuf)
 	}
 
 	mem = gst_dmabuf_allocator_alloc(self->allocator, req.fd, req.size);
-	gst_memory_resize(mem, 0, self->info.size);
+	gst_memory_resize(mem, 0, self->input_size);
 	gbuf = gst_buffer_new();
 	gst_buffer_append_memory(gbuf, mem);
-	if (self->repack_vuy24) {
+	if (self->repack_vuy24 || self->repack_amly) {
+		gint64 begin = self->timing ? g_get_monotonic_time() : 0;
 		GstMapInfo input = GST_MAP_INFO_INIT, output = GST_MAP_INFO_INIT;
 		GstBuffer *converted = NULL;
 		GstFlowReturn acquired = gst_buffer_pool_acquire_buffer(self->repack_pool, &converted, NULL);
@@ -458,8 +549,11 @@ gst_vfmcap_src_create(GstPushSrc *psrc, GstBuffer **outbuf)
 		gboolean synced = ioctl(req.fd, DMA_BUF_IOCTL_SYNC, &sync) == 0;
 		gboolean ok = acquired == GST_FLOW_OK && synced && gst_buffer_map(gbuf, &input, GST_MAP_READ) &&
 			converted && gst_buffer_map(converted, &output, GST_MAP_WRITE);
+		gint64 mapped = self->timing ? g_get_monotonic_time() : 0;
 
-		if (ok) {
+		if (ok && self->repack_amly) {
+			repack_amly(self, output.data, input.data);
+		} else if (ok) {
 			gsize row_bytes = GST_VIDEO_INFO_WIDTH(&self->info) * 3;
 			gsize height = GST_VIDEO_INFO_HEIGHT(&self->info);
 			gsize stride = self->info.stride[0];
@@ -473,6 +567,10 @@ gst_vfmcap_src_create(GstPushSrc *psrc, GstBuffer **outbuf)
 				GST_VIDEO_INFO_WIDTH(&self->info),
 				GST_VIDEO_INFO_HEIGHT(&self->info), self->info.stride[0]);
 		}
+		if (self->timing)
+			GST_INFO_OBJECT(self, "VIM4 packed timing map_sync_ms=%.3f convert_ms=%.3f",
+				(double)(mapped - begin) / 1000.0,
+				(double)(g_get_monotonic_time() - mapped) / 1000.0);
 		if (output.data)
 			gst_buffer_unmap(converted, &output);
 		if (input.data)
@@ -487,7 +585,7 @@ gst_vfmcap_src_create(GstPushSrc *psrc, GstBuffer **outbuf)
 			if (converted)
 				gst_buffer_unref(converted);
 			GST_ELEMENT_ERROR(self, RESOURCE, READ,
-				("Cannot map or synchronize VUY24 frame"), (NULL));
+				("Cannot map or synchronize packed capture frame"), (NULL));
 			return GST_FLOW_ERROR;
 		}
 		gbuf = converted;
@@ -546,7 +644,10 @@ gst_vfmcap_src_get_property(GObject *obj, guint id, GValue *v,
 static void
 gst_vfmcap_src_finalize(GObject *obj)
 {
-	g_free(GST_VFMCAP_SRC(obj)->device);
+	GstVfmCapSrc *self = GST_VFMCAP_SRC(obj);
+	if (self->repack_worker)
+		g_thread_pool_free(self->repack_worker, FALSE, TRUE);
+	g_free(self->device);
 	G_OBJECT_CLASS(gst_vfmcap_src_parent_class)->finalize(obj);
 }
 

@@ -1,7 +1,7 @@
 project('gst-plugin-vfmcap', 'c',
   version : '0.1.0',
   license : 'LGPL-2.1-or-later',
-  default_options : ['warning_level=2', 'c_std=gnu11'])
+  default_options : ['warning_level=2', 'c_std=gnu11', 'buildtype=release'])
 
 gst_dep = dependency('gstreamer-1.0', version : '>= 1.20')
 deps = [
@@ -24,6 +24,8 @@ library('gstvfmcap', ['src/gstvfmcapsrc.c', 'src/gstvim4vdin1src.c'],
   install_dir : gst_dep.get_variable('pluginsdir'))
 
 test('vuy24-repack', executable('test-vuy24', 'tests/test-vuy24.c',
+  include_directories : include_directories('src')))
+test('amly-p010', executable('test-amly', 'tests/test-amly.c',
   include_directories : include_directories('src')))
 
 test('vdin1-capture', executable('test-vdin1',

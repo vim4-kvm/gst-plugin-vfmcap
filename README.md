@@ -2,7 +2,9 @@
 
 GStreamer source `vfmcapsrc` for the `vfm_cap` V4L2 device ([vim4-kvm/common_drivers](https://github.com/vim4-kvm/common_drivers) `drivers/media/vfm_cap`).
 
-Frames are exported as DMA-buf straight from the vdin capture buffers and pushed downstream without copies, so a hardware encoder (`amlvenc`) can consume them directly.
+Eight-bit frames are exported as DMA-buf straight from the vdin capture buffers
+and pushed downstream without copies. Packed ten-bit input uses CPU conversion
+to P010 for the separate Main10 encoder.
 
 The same plugin provides `vim4vdin1src` for the native-HDR 5.15 runtime:
 VDIN0 retains the display's HDR stream while VDIN1 captures independent NV21 SDR
@@ -29,7 +31,18 @@ meson setup build --buildtype=release --prefix=/usr && ninja -C build && meson t
 
 ## Use
 
-vdin0 must write 8-bit NV21/NV12/UYVY or YUV444 (the 10-bit packed default is rejected), and `vfm_cap` must be in the vfm `tvpath` after `vdin0`. See the `vim4-kvm` repo `tools/hdmi-setup.sh`.
+vdin0 must write NV21/NV12/UYVY, YUV444 or packed ten-bit `AMLY`, and `vfm_cap`
+must be in the vfm `tvpath` after `vdin0`. See the `vim4-kvm` repo `tools/hdmi-setup.sh`.
+
+The native-HDR T7 configuration uses full-packed 4:2:2 and `no_swap_en=1`.
+`AMLY` conversion reverses each 128-bit word, unpacks Y-Cr-Y-Cb ten-bit samples,
+then vertically averages chroma into reusable P010 system-memory buffers.
+ARM64 NEON processes complete 32-pixel blocks; the scalar tail preserves padded
+rows. This path copies raw frames and requires cacheable read-only DMA mappings
+and DMA-BUF CPU synchronization. It does not apply a tone curve. Caps retain
+PQ/BT.2020 from the driver's V4L2 colorimetry; use the runtime GStreamer color
+parser because vendor and standard transfer-enum numeric values differ.
+HLG, twelve-bit and non-full-packed input have not been qualified.
 
 YUV444 requires the driver's `VUY3` extension and `no_swap_en=1`. VDIN writes
 Cr-Cb-Y bytes; the source reorders them into standard GStreamer `v308` (Y-Cb-Cr)
