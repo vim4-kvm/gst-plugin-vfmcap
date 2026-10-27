@@ -1,0 +1,57 @@
+// SPDX-License-Identifier: LGPL-2.1-or-later
+#version 450
+
+// T7 no_swap_en=1: Cb,Y0,Cr,Y1 occupy ascending little-endian ten-bit slots.
+// Convert two columns in two rows per invocation without 16/64-bit extensions.
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+layout(set = 0, binding = 0, std430) readonly buffer Input { uint words[]; } src;
+layout(set = 0, binding = 1, std430) writeonly buffer Output { uint words[]; } dst;
+layout(push_constant) uniform Params {
+    uint width;
+    uint height;
+    uint input_stride_bytes;
+    uint output_stride_words;
+} p;
+
+uint read_le32(uint offset)
+{
+    uint index = offset >> 2;
+    uint shift = (offset & 3u) * 8u;
+    uint low = src.words[index];
+    // A shift of 32 is undefined; retain a separate aligned case.
+    if (shift == 0u)
+        return low;
+    return (low >> shift) | (src.words[index + 1u] << (32u - shift));
+}
+
+uvec4 read_pair(uint offset)
+{
+    uint low = read_le32(offset);
+    uint fifth_offset = offset + 4u;
+    uint high = (src.words[fifth_offset >> 2] >>
+                 ((fifth_offset & 3u) * 8u)) & 255u;
+    return uvec4(low & 1023u, (low >> 10) & 1023u,
+                 (low >> 20) & 1023u, ((low >> 30) | (high << 2)) & 1023u);
+}
+
+void main()
+{
+    uint pair = gl_GlobalInvocationID.x;
+    uint row = gl_GlobalInvocationID.y * 2u;
+    if (pair >= p.width / 2u || row >= p.height)
+        return;
+
+    uint offset = row * p.input_stride_bytes + pair * 5u;
+    uvec4 top = read_pair(offset);
+    uvec4 bottom = read_pair(offset + p.input_stride_bytes);
+    uint y = row * p.output_stride_words + pair;
+    dst.words[y] = (top.y << 6) | (top.w << 22);
+    dst.words[y + p.output_stride_words] = (bottom.y << 6) | (bottom.w << 22);
+
+    uint uv = p.output_stride_words * p.height +
+              (row / 2u) * p.output_stride_words + pair;
+    // Match the CPU NEON vrhadd, including rounding odd sums upward.
+    uint cb = (top.x + bottom.x + 1u) >> 1;
+    uint cr = (top.z + bottom.z + 1u) >> 1;
+    dst.words[uv] = (cb << 6) | (cr << 22);
+}
