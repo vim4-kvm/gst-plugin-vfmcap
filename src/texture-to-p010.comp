@@ -1,0 +1,34 @@
+// SPDX-License-Identifier: LGPL-2.1-or-later
+#version 450
+layout(local_size_x = 64) in;
+layout(set = 0, binding = 0) uniform sampler2D luma;
+layout(set = 0, binding = 1) uniform sampler2D chroma;
+layout(set = 0, binding = 2, std430) writeonly buffer Output { uint words[]; } dst;
+layout(push_constant) uniform Params {
+    uint width, height, input_width, input_height, input_stride, output_stride_words;
+} p;
+
+uint sample_luma(vec2 at)
+{
+    return uint(textureLod(luma, at / vec2(p.width, p.height), 0.0).r + 0.5);
+}
+
+void main()
+{
+    uint pair = gl_GlobalInvocationID.x, row = gl_GlobalInvocationID.y * 2u;
+    if (pair >= p.width / 2u || row >= p.height)
+        return;
+    vec2 at = vec2(pair * 2u, row);
+    uint y00 = sample_luma(at + vec2(0.5, 0.5));
+    uint y01 = sample_luma(at + vec2(1.5, 0.5));
+    uint y10 = sample_luma(at + vec2(0.5, 1.5));
+    uint y11 = sample_luma(at + vec2(1.5, 1.5));
+    uint offset = row * p.output_stride_words + pair;
+    dst.words[offset] = (y00 << 6) | (y01 << 22);
+    dst.words[offset + p.output_stride_words] = (y10 << 6) | (y11 << 22);
+    uvec2 uv = uvec2(textureLod(chroma,
+        vec2(float(pair) + 0.5, float(row) + 1.0) / vec2(p.width / 2u, p.height),
+        0.0).rg + 0.5);
+    offset = p.output_stride_words * p.height + row / 2u * p.output_stride_words + pair;
+    dst.words[offset] = (uv.x << 6) | (uv.y << 22);
+}

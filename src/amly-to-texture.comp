@@ -1,0 +1,35 @@
+// SPDX-License-Identifier: LGPL-2.1-or-later
+#version 450
+layout(local_size_x = 64) in;
+layout(set = 0, binding = 0, std430) readonly buffer Input { uint words[]; } src;
+layout(set = 0, binding = 1, r16f) uniform writeonly image2D luma;
+layout(set = 0, binding = 2, rg16f) uniform writeonly image2D chroma;
+layout(push_constant) uniform Params {
+    uint width, height, input_width, input_height, input_stride, output_stride_words;
+} p;
+
+uint read_le32(uint offset)
+{
+    uint index = offset >> 2, shift = (offset & 3u) * 8u;
+    uint low = src.words[index];
+    if (shift == 0u)
+        return low;
+    return (low >> shift) | (src.words[index + 1u] << (32u - shift));
+}
+
+void main()
+{
+    uint pair = gl_GlobalInvocationID.x, row = gl_GlobalInvocationID.y;
+    if (pair >= p.input_width / 2u || row >= p.input_height)
+        return;
+    uint offset = row * p.input_stride + pair * 5u;
+    uint low = read_le32(offset), fifth = offset + 4u;
+    uint high = (src.words[fifth >> 2] >> ((fifth & 3u) * 8u)) & 255u;
+    uvec4 value = uvec4(low & 1023u, (low >> 10) & 1023u, (low >> 20) & 1023u,
+                       ((low >> 30) | (high << 2)) & 1023u);
+    // Binary16 represents every integer from 0 through 1023 exactly. Keep
+    // chroma 4:2:2 here; the scaler also performs 4:2:0 subsampling.
+    imageStore(luma, ivec2(pair * 2u, row), vec4(value.y));
+    imageStore(luma, ivec2(pair * 2u + 1u, row), vec4(value.w));
+    imageStore(chroma, ivec2(pair, row), vec4(value.xzxx));
+}

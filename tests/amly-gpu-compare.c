@@ -103,21 +103,74 @@ static void fill_synthetic(guint8 *data, guint width, guint height, guint stride
     }
 }
 
+static guint sample(const guint8 *input, guint stride, guint x, guint y, guint channel)
+{
+    const guint8 *bytes = input + (gsize)y * stride + x * 5;
+    guint64 pair = 0;
+    for (guint i = 0; i < 5; i++)
+        pair |= (guint64)bytes[i] << (8 * i);
+    return (pair >> (10 * channel)) & 1023;
+}
+
+static double filtered_sample(const guint8 *input, guint stride, guint width,
+    guint height, double x, double y, gint channel)
+{
+    guint columns = channel < 0 ? width : width / 2;
+    x = CLAMP(x, 0.0, columns - 1.0);
+    y = CLAMP(y, 0.0, height - 1.0);
+    guint left = x, top = y;
+    guint right = MIN(left + 1, columns - 1), bottom = MIN(top + 1, height - 1);
+    double result = 0;
+    for (guint row = 0; row < 2; row++) {
+        for (guint col = 0; col < 2; col++) {
+            guint sx = col ? right : left, sy = row ? bottom : top;
+            guint value = channel < 0 ? sample(input, stride, sx / 2, sy, 1 + 2 * (sx & 1)) :
+                sample(input, stride, sx, sy, channel);
+            result += value * (col ? x - left : 1 - (x - left)) *
+                (row ? y - top : 1 - (y - top));
+        }
+    }
+    return result;
+}
+
+static void reference_scale(guint8 *output, const guint8 *input, guint width,
+    guint height, guint out_width, guint out_height, guint input_stride, guint output_stride)
+{
+    double rx = (double)width / out_width, ry = (double)height / out_height;
+    for (guint y = 0; y < out_height; y++) {
+        guint16 *row = (guint16 *)(output + (gsize)y * output_stride);
+        for (guint x = 0; x < out_width; x++)
+            row[x] = (guint16)(filtered_sample(input, input_stride, width, height,
+                (x + 0.5) * rx - 0.5, (y + 0.5) * ry - 0.5, -1) + 0.5) << 6;
+    }
+    for (guint y = 0; y < out_height / 2; y++) {
+        guint16 *row = (guint16 *)(output + (gsize)(out_height + y) * output_stride);
+        for (guint x = 0; x < out_width / 2; x++) {
+            for (guint c = 0; c < 2; c++)
+                row[x * 2 + c] = (guint16)(filtered_sample(input, input_stride, width, height,
+                    (x + 0.5) * rx - 0.5, (y * 2 + 1) * ry - 0.5, c * 2) + 0.5) << 6;
+        }
+    }
+}
+
 static gboolean run_frame(AmlyGpu *gpu, const char *raw_file, guint width,
-                           guint height, guint input_stride, guint output_stride,
-                           guint iterations)
+                           guint height, guint out_width, guint out_height,
+                           guint input_stride, guint output_stride, guint iterations)
 {
     DmaBuffer input = {.fd = -1}, output = {.fd = -1};
     guint64 input_bytes = (guint64)input_stride * height;
-    guint64 output_luma_size = (guint64)output_stride * height;
+    guint64 output_luma_size = (guint64)output_stride * out_height;
     guint64 output_bytes = output_luma_size <= G_MAXUINT32 ? output_luma_size * 3 / 2 : G_MAXUINT64;
     gboolean ok = FALSE;
     guint8 *expected = NULL;
     gchar *raw = NULL;
     GError *error = NULL;
+    gboolean scaled = width != out_width || height != out_height;
     if (!width || !height || (width & 1) || (height & 1) || !iterations ||
+        !out_width || !out_height || (out_width & 1) || (out_height & 1) ||
+        out_width > width || out_height > height ||
         (guint64)input_stride < (guint64)width * 5 / 2 ||
-        (guint64)output_stride < (guint64)width * 2 || output_stride % 16 ||
+        (guint64)output_stride < (guint64)out_width * 2 || output_stride % 16 ||
         input_bytes > G_MAXUINT32 - 4095 || output_bytes > G_MAXUINT32 - 4095) {
         g_printerr("Invalid frame dimensions/pitches/iteration count\n");
         goto cleanup;
@@ -152,33 +205,61 @@ static gboolean run_frame(AmlyGpu *gpu, const char *raw_file, guint width,
     if (!dma_sync(&input, DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ))
         goto cleanup;
     gint64 before = g_get_monotonic_time();
-    amly_to_p010((uint16_t *)expected,
-        (uint16_t *)(expected + (gsize)output_stride * height), input.map,
-        width, height, input_stride, output_stride / 2);
+    if (scaled)
+        reference_scale(expected, input.map, width, height, out_width, out_height,
+                        input_stride, output_stride);
+    else
+        amly_to_p010((uint16_t *)expected,
+            (uint16_t *)(expected + (gsize)output_stride * height), input.map,
+            width, height, input_stride, output_stride / 2);
     double cpu_ms = (g_get_monotonic_time() - before) / 1000.0;
     if (!dma_sync(&input, DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ))
         goto cleanup;
 
     double total_ms = 0, max_ms = 0;
+    guint max_sample_error = 0;
     for (guint iteration = 0; iteration < iterations; iteration++) {
-        if (!dma_sync(&output, DMA_BUF_SYNC_START | DMA_BUF_SYNC_WRITE))
-            goto cleanup;
-        memset(output.map, 0xa5, output.size);
-        if (!dma_sync(&output, DMA_BUF_SYNC_END | DMA_BUF_SYNC_WRITE))
-            goto cleanup;
+        if (!iteration) {
+            if (!dma_sync(&output, DMA_BUF_SYNC_START | DMA_BUF_SYNC_WRITE))
+                goto cleanup;
+            memset(output.map, 0xa5, output.size);
+            if (!dma_sync(&output, DMA_BUF_SYNC_END | DMA_BUF_SYNC_WRITE))
+                goto cleanup;
+        }
         before = g_get_monotonic_time();
-        if (!amly_gpu_convert(gpu, input.fd, input.size, output.fd, output.size,
-                                width, height, input_stride, output_stride, &error)) {
+        if (!amly_gpu_convert_scaled(gpu, input.fd, input.size, output.fd, output.size,
+                width, height, out_width, out_height, input_stride, output_stride, &error)) {
             g_printerr("GPU conversion: %s\n", error->message);
             goto cleanup;
         }
         double ms = (g_get_monotonic_time() - before) / 1000.0;
         total_ms += ms;
         max_ms = MAX(max_ms, ms);
+        // Compare the first and final job. Scanning a large mapped DMA frame
+        // between every dispatch prevents measuring sustained GPU throughput.
+        if (iteration && iteration + 1 < iterations)
+            continue;
         if (!dma_sync(&output, DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ))
             goto cleanup;
         gsize mismatch = G_MAXSIZE;
         for (gsize byte = 0; byte < output_bytes; byte++) {
+            if (scaled && byte % output_stride < out_width * 2) {
+                // Mali's texture filter uses finite subtexel precision. Bound
+                // the difference against full double interpolation, while
+                // checking that output remains ten-bit with zero low bits.
+                guint16 actual, reference;
+                memcpy(&actual, output.map + byte, 2);
+                memcpy(&reference, expected + byte, 2);
+                guint delta = ABS((int)actual - reference) >> 6;
+                max_sample_error = MAX(max_sample_error, delta);
+                if (!(actual & 63) && delta <= 6) {
+                    byte++;
+                    continue;
+                }
+                g_printerr("Scaled sample offset=%zu GPU=%u reference=%u\n", byte, actual >> 6, reference >> 6);
+                mismatch = byte;
+                break;
+            }
             if (output.map[byte] != expected[byte]) {
                 mismatch = byte;
                 break;
@@ -199,10 +280,10 @@ static gboolean run_frame(AmlyGpu *gpu, const char *raw_file, guint width,
         if (!synced || mismatch != G_MAXSIZE)
             goto cleanup;
     }
-    g_print("same_frame=PASS width=%u height=%u input_pitch=%u output_pitch=%u "
-        "iterations=%u cpu_conversion_ms=%.3f gpu_total_avg_ms=%.3f gpu_total_max_ms=%.3f\n",
-        width, height, input_stride, output_stride, iterations,
-        cpu_ms, total_ms / iterations, max_ms);
+    g_print("same_frame=PASS width=%u height=%u output=%ux%u input_pitch=%u output_pitch=%u "
+        "iterations=%u max_sample_error=%u cpu_conversion_ms=%.3f gpu_total_avg_ms=%.3f gpu_total_max_ms=%.3f\n",
+        width, height, out_width, out_height, input_stride, output_stride, iterations,
+        max_sample_error, cpu_ms, total_ms / iterations, max_ms);
     ok = TRUE;
 
 cleanup:
@@ -229,11 +310,12 @@ int main(int argc, char **argv)
 {
     const char *raw_file = NULL;
     guint dimensions[5] = {0, 0, 0, 0, 1};
+    gboolean scale_mode = argc > 1 && !strcmp(argv[1], "--scale");
     if (argc != 1) {
         gboolean raw_mode = !strcmp(argv[1], "--raw");
         gboolean synthetic_mode = !strcmp(argv[1], "--synthetic");
         int first = raw_mode ? 3 : 2;
-        if ((!raw_mode && !synthetic_mode) ||
+        if ((!raw_mode && !synthetic_mode && !scale_mode) ||
             (argc != first + 4 && argc != first + 5))
             goto usage;
         if (raw_mode)
@@ -258,18 +340,28 @@ int main(int argc, char **argv)
             guint height = width < 1920 ? 6 : (width == 3840 ? 2160 : 1440);
             guint input_stride = width * 5 / 2 + (i % 3);
             guint output_stride = (width * 2 + 63) & ~63u;
-            ok = run_frame(gpu, NULL, width, height, input_stride, output_stride, 1);
+            ok = run_frame(gpu, NULL, width, height, width, height, input_stride, output_stride, 1);
         }
+        const guint sizes[][4] = {{6, 6, 2, 2}, {130, 34, 66, 18},
+            {3840, 2160, 3022, 1700}, {3840, 2160, 1920, 1080}, {3440, 1440, 2560, 1070}};
+        for (guint i = 0; i < G_N_ELEMENTS(sizes) && ok; i++)
+            ok = run_frame(gpu, NULL, sizes[i][0], sizes[i][1], sizes[i][2], sizes[i][3],
+                ((sizes[i][0] * 5 / 2 + 15) & ~15u) + i % 3,
+                (sizes[i][2] * 2 + 63) & ~63u, 2);
+    } else if (scale_mode) {
+        ok = run_frame(gpu, NULL, dimensions[0], dimensions[1], dimensions[2], dimensions[3],
+            (dimensions[0] * 5 / 2 + 15) & ~15u, (dimensions[2] * 2 + 63) & ~63u, dimensions[4]);
     } else {
-        ok = run_frame(gpu, raw_file, dimensions[0], dimensions[1], dimensions[2],
-                         dimensions[3], dimensions[4]);
+        ok = run_frame(gpu, raw_file, dimensions[0], dimensions[1], dimensions[0], dimensions[1],
+                         dimensions[2], dimensions[3], dimensions[4]);
     }
     amly_gpu_free(gpu);
     return ok ? 0 : 1;
 
 usage:
     g_printerr("usage: %s [--raw FILE | --synthetic] WIDTH HEIGHT INPUT_PITCH OUTPUT_PITCH [ITERATIONS]\n"
+        "       %s --scale WIDTH HEIGHT OUT_WIDTH OUT_HEIGHT [ITERATIONS]\n"
         "       %s  # synthetic geometry/color/padding suite on real Mali-G52\n",
-        argv[0], argv[0]);
+        argv[0], argv[0], argv[0]);
     return 2;
 }

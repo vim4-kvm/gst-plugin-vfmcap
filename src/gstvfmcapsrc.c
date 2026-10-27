@@ -68,6 +68,8 @@ struct _GstVfmCapSrc {
 #endif
 	guint input_size;
 	guint input_stride;
+	guint input_width, input_height;
+	guint output_height;
 
 	GstAllocator *allocator;
 	GstBufferPool *repack_pool;
@@ -134,6 +136,7 @@ enum {
 	PROP_0,
 	PROP_DEVICE,
 	PROP_GPU_CONVERSION,
+	PROP_HEIGHT,
 };
 
 static GstStaticPadTemplate src_template = GST_STATIC_PAD_TEMPLATE("src",
@@ -186,6 +189,7 @@ query_format(GstVfmCapSrc *self)
 	GstVideoFormat vfmt;
 	GstVideoInfo old = self->info;
 	guint old_size = self->input_size, old_stride = self->input_stride;
+	guint old_width = self->input_width, old_height = self->input_height;
 	gboolean old_amly = self->repack_amly, old_vuy24 = self->repack_vuy24;
 
 	if (ioctl(self->fd, VIDIOC_G_FMT, &f) < 0) {
@@ -206,6 +210,18 @@ query_format(GstVfmCapSrc *self)
 	self->repack_amly = mp->pixelformat == V4L2_PIX_FMT_AMLY;
 	self->input_size = mp->plane_fmt[0].sizeimage;
 	self->input_stride = mp->plane_fmt[0].bytesperline;
+	self->input_width = mp->width;
+	self->input_height = mp->height;
+	gboolean scaled = self->output_height && self->output_height < mp->height;
+	if (scaled) {
+		if (!self->repack_amly || self->output_height % 2) {
+			GST_ELEMENT_ERROR(self, STREAM, FORMAT,
+				("GPU scaling requires packed ten-bit input and an even height"), (NULL));
+			return FALSE;
+		}
+		guint width = (guint64)mp->width * self->output_height / mp->height & ~1u;
+		gst_video_info_set_format(&self->info, vfmt, MAX(width, 2u), self->output_height);
+	}
 	if (self->repack_amly && (mp->width % 2 || mp->height % 2 ||
 	    self->input_stride % 16 ||
 	    self->input_stride < (((guint64)mp->width * 5 / 2 + 15) & ~(guint64)15) ||
@@ -232,10 +248,10 @@ query_format(GstVfmCapSrc *self)
 	if (!self->repack_amly)
 		self->info.size = mp->plane_fmt[0].sizeimage;
 	else {
-		gsize pitch = ((gsize)mp->width * 2 + 63) & ~(gsize)63;
+		gsize pitch = ((gsize)self->info.width * 2 + 63) & ~(gsize)63;
 		self->info.stride[0] = self->info.stride[1] = pitch;
-		self->info.offset[1] = pitch * mp->height;
-		self->info.size = pitch * mp->height * 3 / 2;
+		self->info.offset[1] = pitch * self->info.height;
+		self->info.size = pitch * self->info.height * 3 / 2;
 	}
 	if (mp->colorspace == V4L2_COLORSPACE_REC709)
 		gst_video_colorimetry_from_string(&self->info.colorimetry, "bt709");
@@ -254,6 +270,7 @@ query_format(GstVfmCapSrc *self)
 	/* get_caps/negotiate can query repeatedly before the first frame. Keep the
 	 * same preallocated CMA slots unless geometry or colorimetry really changed. */
 	if (self->info_valid && old_size == self->input_size && old_stride == self->input_stride &&
+	    old_width == self->input_width && old_height == self->input_height &&
 	    old_amly == self->repack_amly && old_vuy24 == self->repack_vuy24 &&
 	    gst_video_info_is_equal(&old, &self->info) && old.size == self->info.size &&
 	    (!(self->repack_amly || self->repack_vuy24) || self->repack_pool))
@@ -264,7 +281,7 @@ query_format(GstVfmCapSrc *self)
 		GError *error = NULL;
 		self->gpu = amly_gpu_new(&error);
 		if (self->gpu) {
-			gsize pitch = ((gsize)mp->width * 2 + 63) & ~(gsize)63;
+			gsize pitch = self->info.stride[0];
 			/* The low-delay SDK retires the submitted input on each completed
 			 * encode call. Two slots overlap GPU N+1 with encoder N. */
 			GstBufferPool *pool = codecmm_pool_new(self->info.size, 2, &error);
@@ -285,6 +302,11 @@ query_format(GstVfmCapSrc *self)
 		g_clear_error(&error);
 	}
 #endif
+	if (scaled && !self->repack_pool) {
+		GST_ELEMENT_ERROR(self, RESOURCE, SETTINGS,
+			("Packed ten-bit scaling requires the Mali GPU and contiguous output buffers"), (NULL));
+		return FALSE;
+	}
 	if (self->repack_vuy24 || self->repack_amly) {
 		GstStructure *config;
 		if (self->repack_pool)
@@ -638,8 +660,9 @@ gst_vfmcap_src_create(GstPushSrc *psrc, GstBuffer **outbuf)
 		gsize capacity, offset;
 		gst_memory_get_sizes(output, &offset, &capacity);
 		GError *error = NULL;
-		gboolean ok = amly_gpu_convert(self->gpu, req.fd, req.size,
+		gboolean ok = amly_gpu_convert_scaled(self->gpu, req.fd, req.size,
 			gst_dmabuf_memory_get_fd(output), capacity,
+			self->input_width, self->input_height,
 			self->info.width, self->info.height, self->input_stride,
 			self->info.stride[0], &error);
 		/* GPU imports must be gone before dropping the captured frame fd. */
@@ -742,6 +765,9 @@ gst_vfmcap_src_set_property(GObject *obj, guint id, const GValue *v,
 	case PROP_GPU_CONVERSION:
 		self->gpu_conversion = g_value_get_boolean(v);
 		break;
+	case PROP_HEIGHT:
+		self->output_height = g_value_get_uint(v);
+		break;
 	default:
 		G_OBJECT_WARN_INVALID_PROPERTY_ID(obj, id, pspec);
 	}
@@ -759,6 +785,9 @@ gst_vfmcap_src_get_property(GObject *obj, guint id, GValue *v,
 		break;
 	case PROP_GPU_CONVERSION:
 		g_value_set_boolean(v, self->gpu_conversion);
+		break;
+	case PROP_HEIGHT:
+		g_value_set_uint(v, self->output_height);
 		break;
 	default:
 		G_OBJECT_WARN_INVALID_PROPERTY_ID(obj, id, pspec);
@@ -796,6 +825,10 @@ gst_vfmcap_src_class_init(GstVfmCapSrcClass *klass)
 		g_param_spec_boolean("gpu-conversion", "GPU conversion",
 			"Use Mali compute and contiguous DMA for packed 10-bit input when available",
 			TRUE, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS | GST_PARAM_MUTABLE_READY));
+	g_object_class_install_property(gobject_class, PROP_HEIGHT,
+		g_param_spec_uint("height", "Output height",
+			"Maximum packed ten-bit output height, zero keeps native size; scaling requires Mali GPU",
+			0, 2160, 0, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS | GST_PARAM_MUTABLE_READY));
 
 	gst_element_class_set_static_metadata(element_class,
 		"VFM capture source", "Source/Video",

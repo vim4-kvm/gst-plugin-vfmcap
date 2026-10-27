@@ -24,15 +24,24 @@ if gpu_dep.found()
   glslang = find_program('glslangValidator')
   python = import('python').find_installation('python3')
   spirv = custom_target('amly-spirv', input : 'src/amly-to-p010.comp',
-    output : 'amly-to-p010.spv', command : [glslang, '-V', '@INPUT@', '-o', '@OUTPUT@'])
+    output : 'amly-to-p010.spv', command : [glslang, '-V', '-Os', '@INPUT@', '-o', '@OUTPUT@'])
   shader_header = custom_target('amly-shader-header', input : spirv,
     output : 'amly-to-p010-spirv.h',
     command : [python, files('scripts/embed-spirv.py'), '@INPUT@', '@OUTPUT@'])
-  sources += ['src/amly-gpu.c', shader_header]
+  scale_headers = []
+  foreach name : ['amly-to-texture', 'texture-to-p010']
+    scale_spirv = custom_target(name + '-spirv', input : 'src/' + name + '.comp',
+      output : name + '.spv', command : [glslang, '-V', '-Os', '@INPUT@', '-o', '@OUTPUT@'])
+    scale_headers += custom_target(name + '-header', input : scale_spirv,
+      output : name + '-spirv.h',
+      command : [python, files('scripts/embed-spirv.py'), '@INPUT@', '@OUTPUT@'])
+  endforeach
+  gpu_sources = ['src/amly-gpu.c', 'src/amly-gpu-scale.c', shader_header] + scale_headers
+  sources += gpu_sources
   deps += [gpu_dep]
   add_project_arguments('-DHAVE_AMLY_GPU=1', language : 'c')
   # Uses contiguous DMA heaps and real Mali hardware; run only on the board.
-  executable('amly-gpu-compare', ['tests/amly-gpu-compare.c', 'src/amly-gpu.c', shader_header],
+  executable('amly-gpu-compare', ['tests/amly-gpu-compare.c'] + gpu_sources,
     dependencies : deps, include_directories : include_directories('src', '.'))
 endif
 

@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 #include "amly-gpu.h"
+#include "amly-gpu-scale.h"
 #include "amly-to-p010-spirv.h"
 
 #include <errno.h>
@@ -17,6 +18,7 @@ typedef struct {
 
 typedef struct {
     guint32 width, height, input_stride, output_stride_words;
+    guint32 input_width, input_height;
 } ConvertParams;
 
 struct AmlyGpu {
@@ -30,6 +32,8 @@ struct AmlyGpu {
     VkDescriptorSetLayout descriptor_layout;
     VkPipelineLayout pipeline_layout;
     VkPipeline pipeline;
+    AmlyGpuScaler *scaler;
+    guint scale_input_width, scale_input_height;
     VkDescriptorPool descriptor_pool;
     VkDescriptorSet descriptor_set;
     VkCommandPool command_pool;
@@ -172,6 +176,10 @@ static gboolean create_device(AmlyGpu *gpu, GError **error)
         .enabledExtensionCount = G_N_ELEMENTS(extensions),
         .ppEnabledExtensionNames = extensions,
     };
+    VkPhysicalDeviceFeatures available, enabled = {0};
+    vkGetPhysicalDeviceFeatures(gpu->physical, &available);
+    enabled.shaderStorageImageExtendedFormats = available.shaderStorageImageExtendedFormats;
+    create.pEnabledFeatures = &enabled;
     result = vkCreateDevice(gpu->physical, &create, NULL, &gpu->device);
     if (result != VK_SUCCESS)
         return fail(error, "vkCreateDevice", result);
@@ -448,13 +456,18 @@ static gboolean record_commands(AmlyGpu *gpu, ImportedBuffer *input,
     if (result != VK_SUCCESS)
         return fail(error, "vkBeginCommandBuffer", result);
     buffer_barriers(gpu, input, output, TRUE);
-    vkCmdBindPipeline(gpu->command, VK_PIPELINE_BIND_POINT_COMPUTE, gpu->pipeline);
-    vkCmdBindDescriptorSets(gpu->command, VK_PIPELINE_BIND_POINT_COMPUTE,
-        gpu->pipeline_layout, 0, 1, &gpu->descriptor_set, 0, NULL);
-    vkCmdPushConstants(gpu->command, gpu->pipeline_layout,
-        VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(*params), params);
-    vkCmdDispatch(gpu->command, (params->width / 2 + 63) / 64,
-                    params->height / 2, 1);
+    if (params->width != params->input_width || params->height != params->input_height) {
+        amly_gpu_scaler_record(gpu->scaler, gpu->command, input->buffer, input_range,
+            output->buffer, output_range, params->width, params->height,
+            params->input_stride, params->output_stride_words);
+    } else {
+        vkCmdBindPipeline(gpu->command, VK_PIPELINE_BIND_POINT_COMPUTE, gpu->pipeline);
+        vkCmdBindDescriptorSets(gpu->command, VK_PIPELINE_BIND_POINT_COMPUTE,
+            gpu->pipeline_layout, 0, 1, &gpu->descriptor_set, 0, NULL);
+        vkCmdPushConstants(gpu->command, gpu->pipeline_layout,
+            VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(*params), params);
+        vkCmdDispatch(gpu->command, (params->width / 2 + 63) / 64, params->height / 2, 1);
+    }
     buffer_barriers(gpu, input, output, FALSE);
     result = vkEndCommandBuffer(gpu->command);
     return result == VK_SUCCESS || fail(error, "vkEndCommandBuffer", result);
@@ -465,15 +478,27 @@ gboolean amly_gpu_convert(AmlyGpu *gpu, int input_fd, gsize input_size,
                          guint height, guint input_stride,
                          guint output_stride_bytes, GError **error)
 {
+    return amly_gpu_convert_scaled(gpu, input_fd, input_size, output_fd, output_size,
+        width, height, width, height, input_stride, output_stride_bytes, error);
+}
+
+gboolean amly_gpu_convert_scaled(AmlyGpu *gpu, int input_fd, gsize input_size,
+                         int output_fd, gsize output_size,
+                         guint input_width, guint input_height,
+                         guint width, guint height, guint input_stride,
+                         guint output_stride_bytes, GError **error)
+{
     if (!gpu || gpu->failed)
         return invalid(error, "AMLY GPU instance is unavailable after a device error");
     if (input_fd < 0 || output_fd < 0 || input_fd == output_fd ||
         !width || !height || (width & 1) || (height & 1) ||
-        (guint64)input_stride < (guint64)width * 5 / 2 ||
+        !input_width || !input_height || (input_width & 1) || (input_height & 1) ||
+        width > input_width || height > input_height ||
+        (guint64)input_stride < (guint64)input_width * 5 / 2 ||
         (guint64)output_stride_bytes < (guint64)width * 2 ||
         output_stride_bytes % 16)
         return invalid(error, "AMLY conversion requires distinct DMA fds, even geometry and valid pitches");
-    guint64 input_range = ((guint64)input_stride * height + 3) & ~(guint64)3;
+    guint64 input_range = ((guint64)input_stride * input_height + 3) & ~(guint64)3;
     guint64 output_luma_size = (guint64)output_stride_bytes * height;
     if (input_range > G_MAXUINT32 || output_luma_size > G_MAXUINT32)
         return invalid(error, "AMLY shader byte offsets exceed 32-bit addressing");
@@ -489,6 +514,19 @@ gboolean amly_gpu_convert(AmlyGpu *gpu, int input_fd, gsize input_size,
 
     ImportedBuffer input = {0}, output = {0};
     gboolean ok = FALSE;
+    if (width != input_width || height != input_height) {
+        if (gpu->scaler && (gpu->scale_input_width != input_width || gpu->scale_input_height != input_height)) {
+            amly_gpu_scaler_free(gpu->scaler);
+            gpu->scaler = NULL;
+        }
+        if (!gpu->scaler) {
+            gpu->scaler = amly_gpu_scaler_new(gpu->physical, gpu->device, input_width, input_height, error);
+            if (!gpu->scaler)
+                return FALSE;
+            gpu->scale_input_width = input_width;
+            gpu->scale_input_height = input_height;
+        }
+    }
     gint64 t0 = gpu->timing ? g_get_monotonic_time() : 0;
     gint64 t1 = t0, t2 = t0, t3 = t0;
     if (!import_buffer(gpu, input_fd, input_size, input_range, &input, error) ||
@@ -496,7 +534,8 @@ gboolean amly_gpu_convert(AmlyGpu *gpu, int input_fd, gsize input_size,
         goto cleanup;
     if (gpu->timing)
         t1 = g_get_monotonic_time();
-    ConvertParams params = {width, height, input_stride, output_stride_bytes / 4};
+    ConvertParams params = {width, height, input_stride, output_stride_bytes / 4,
+                            input_width, input_height};
     if (!record_commands(gpu, &input, &output, input_range, output_range,
                            &params, error))
         goto cleanup;
@@ -563,6 +602,7 @@ void amly_gpu_free(AmlyGpu *gpu)
         return;
     if (gpu->device) {
         vkDeviceWaitIdle(gpu->device);
+        amly_gpu_scaler_free(gpu->scaler);
         if (gpu->fence)
             vkDestroyFence(gpu->device, gpu->fence, NULL);
         if (gpu->command_pool)

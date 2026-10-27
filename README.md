@@ -48,6 +48,17 @@ retirement. This two-slot budget requires the current low-delay encoder SDK,
 which retires the submitted DMA input on each completed call. Pool flushing
 wakes a source blocked waiting for an output slot.
 
+For packed ten-bit input, `vfmcapsrc height=1700` requests a smaller even height
+and derives an even width preserving the input aspect ratio (4K becomes
+3022×1700). Zero or a height at least as large as the input keeps native size.
+Scaling requires Mali and contiguous output buffers; it fails explicitly when
+unavailable. Native-size conversion retains its CPU fallback.
+The scaler unpacks into two fixed GPU-private R16F/RG16F textures, retaining
+4:2:2 chroma until bilinear resizing and 4:2:0 subsampling. Binary16 represents
+all ten-bit integer samples exactly. Texture interpolation has finite subtexel
+precision; it does not apply a tone curve or change PQ/BT.2020. The final P010
+surface uses the same bounded DMA pool and encoder retirement contract.
+
 When Vulkan or contiguous allocation is unavailable at startup, CPU conversion
 uses reusable system-memory buffers. `gpu-conversion=false` forces that path for
 comparisons. A GPU error after submission fails the stream instead of returning
@@ -65,9 +76,15 @@ the CPU converter. For an actual captured frame, including optional page padding
 
 ```sh
 VK_ICD_FILENAMES=/usr/lib/vim4-kvm/gpu/mali.json build/amly-gpu-compare --raw capture.amly 3840 2160 9600 7680 3
+VK_ICD_FILENAMES=/usr/lib/vim4-kvm/gpu/mali.json build/amly-gpu-compare --scale 3840 2160 3022 1700 120
 ```
 
-This replays the same frame and checks all output bytes/padding; it does not
+This replays the same frame and checks visible samples and padding on the first
+and final dispatch. Native conversion remains byte-exact. Scaled output is
+compared with an independent double-precision bilinear reference (maximum six
+ten-bit code values for the qualified Mali texture filter), with zero low P010
+bits and unchanged padding. The default suite includes clamped edges, unusual
+pitches, non-block-aligned dimensions, 4K downscales and ultrawide input. It does not
 measure capture/encode/browser throughput. `VIM4_VIDEO_TIMING=1` also reports
 GPU import, dispatch, fence wait, and import destruction/idle every120frames.
 
@@ -112,6 +129,7 @@ gst-launch-1.0 vfmcapsrc ! queue ! amlvenc bitrate=8000 ! video/x-h264 ! h264par
 |---|---|---|
 | `device` | `/dev/video_cap` | vfm_cap device node |
 | `gpu-conversion` | `true` | Try Mali conversion for packed ten-bit; startup failures fall back to CPU |
+| `height` | `0` | Maximum packed ten-bit output height; smaller values must be even and require GPU scaling |
 
 On a source change (resolution/format) the element renegotiates caps. Timestamps are taken from the pipeline clock at dequeue time; caps carry `framerate=0/1` since the rate follows the HDMI source.
 

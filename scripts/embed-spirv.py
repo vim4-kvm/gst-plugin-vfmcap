@@ -13,9 +13,12 @@ def main():
     if len(data) < 20 or len(data) % 4 or data[:4] != b"\x03\x02\x23\x07":
         raise SystemExit("input is not a little-endian SPIR-V module")
     words = struct.unpack(f"<{len(data) // 4}I", data)
-    lines = ["/* Generated from amly-to-p010.comp; do not edit. */",
+    symbol = pathlib.Path(sys.argv[1]).stem.replace("-", "_")
+    if not symbol.isascii() or not symbol.isidentifier():
+        raise SystemExit("input filename must form a C identifier")
+    lines = [f"/* Generated from {pathlib.Path(sys.argv[1]).stem}.comp; do not edit. */",
              "#include <stdint.h>",
-             "static const uint32_t amly_to_p010_spirv[] = {"]
+             f"static const uint32_t {symbol}_spirv[] = {{"]
     for offset in range(0, len(words), 8):
         lines.append("    " + ", ".join(f"0x{word:08x}" for word in words[offset:offset + 8]) + ",")
     lines.append("};\n")

@@ -24,6 +24,17 @@ gboolean amly_gpu_convert(AmlyGpu *gpu, int input_fd, gsize input_size,
                          guint height, guint input_stride,
                          guint output_stride_bytes, GError **error);
 
+/* The same ownership contract with GPU unpacking and bilinear downscaling.
+ * Output dimensions must be even, positive and no larger than the input.
+ * P010 UV follows output_stride_bytes * output_height. Samples remain ten-bit;
+ * no tone mapping or transfer-function conversion is performed. */
+gboolean amly_gpu_convert_scaled(AmlyGpu *gpu, int input_fd, gsize input_size,
+                         int output_fd, gsize output_size,
+                         guint input_width, guint input_height,
+                         guint output_width, guint output_height,
+                         guint input_stride, guint output_stride_bytes,
+                         GError **error);
+
 void amly_gpu_free(AmlyGpu *gpu);
 
 #endif
