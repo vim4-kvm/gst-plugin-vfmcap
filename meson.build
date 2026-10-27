@@ -19,6 +19,12 @@ add_project_arguments(
   language : 'c')
 
 sources = ['src/gstvfmcapsrc.c', 'src/gstvim4vdin1src.c', 'src/codecmm-pool.c']
+ge2d = meson.get_compiler('c').find_library('ge2d', required : false)
+if ge2d.found()
+  sources += ['src/gstvim4scale.c']
+  deps += [ge2d]
+  add_project_arguments('-DHAVE_VIM4_SCALE=1', language : 'c')
+endif
 gpu_dep = dependency('vulkan', required : false)
 if gpu_dep.found()
   glslang = find_program('glslangValidator')
@@ -49,6 +55,15 @@ library('gstvfmcap', sources,
   dependencies : deps,
   install : true,
   install_dir : gst_dep.get_variable('pluginsdir'))
+
+if ge2d.found()
+  test('sdr-scale', executable('test-sdr-scale', 'tests/test-sdr-scale.c',
+    dependencies : deps + [dependency('gstreamer-check-1.0')],
+    include_directories : include_directories('src')))
+  executable('sdr-scale-compare', 'tests/sdr-scale-compare.c',
+    dependencies : deps + [dependency('gstreamer-app-1.0')],
+    include_directories : include_directories('src'))
+endif
 
 test('codecmm-pool', executable('test-codecmm-pool', 'tests/test-codecmm-pool.c',
   dependencies : deps, include_directories : include_directories('src')))

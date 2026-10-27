@@ -23,6 +23,27 @@ budget during VRR; the measured `Frame Rate` remains the fallback for older
 kernels. An explicitly unknown base rate is rejected. This does not pace or
 duplicate frames, advertise VRR through EDID, or qualify hardware VRR support.
 
+With the Amlogic `libge2d` development library, this plugin also builds
+`vim4scale`: a DMA-only NV12/NV21 → NV12 SDR downscaler. `height=0` preserves
+native dimensions; smaller even heights preserve aspect ratio. The optional
+`width-alignment=16` satisfies the vendor HEVC encoder; H.264 uses the default 2.
+Alternatively, fix the output dimensions with raw-video caps. It never upscales.
+Visible width and actual VideoMeta row pitch are separate GE2D parameters,
+so a 3440-pixel image in 3456-byte rows is scaled without shearing or CPU copies.
+Input must be one contiguous DMA allocation, with equal 64-byte-aligned Y/UV
+pitches and UV immediately after the Y rows. The board launcher selects this
+V4L2 layout on 5.15 (`GST_V4L2_PREFER_CONTIGUOUS=1`); 7.3 keeps separate plane views.
+Native-size negotiation preserves the input format and DMA buffer without a blit
+or output pool. Scaled output uses three bounded codecmm slots, a 64-byte pitch
+and explicit VideoMeta.
+Submission completes synchronously before releasing the input. Flush and stop
+wake blocked output acquisitions; retained outputs own their DMA fds until release.
+
+`sdr-scale-compare --exclusive` is an idle-board diagnostic, not an automatic
+test: it checks poisonous input padding, visible luma, NV21→NV12 chroma, PTS and
+repeated processing for 3440×1440→1720/1712×720. Its throughput is GE2D-only;
+measure capture, encoding and browser playback separately.
+
 ## Build
 
 ```sh

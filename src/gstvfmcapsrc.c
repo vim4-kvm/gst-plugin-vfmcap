@@ -861,6 +861,11 @@ gst_vfmcap_src_init(GstVfmCapSrc *self)
 static gboolean
 plugin_init(GstPlugin *plugin)
 {
+#ifdef HAVE_VIM4_SCALE
+	extern GType gst_vim4_scale_get_type(void);
+	if (!gst_element_register(plugin, "vim4scale", GST_RANK_NONE, gst_vim4_scale_get_type()))
+		return FALSE;
+#endif
 	GST_DEBUG_CATEGORY_INIT(vfmcapsrc_debug, "vfmcapsrc", 0,
 				"vfm_cap source");
 	return gst_element_register(plugin, "vfmcapsrc", GST_RANK_NONE,
