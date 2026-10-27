@@ -265,13 +265,15 @@ query_format(GstVfmCapSrc *self)
 		self->gpu = amly_gpu_new(&error);
 		if (self->gpu) {
 			gsize pitch = ((gsize)mp->width * 2 + 63) & ~(gsize)63;
-			GstBufferPool *pool = codecmm_pool_new(self->info.size, 4, &error);
+			/* The low-delay SDK retires the submitted input on each completed
+			 * encode call. Two slots overlap GPU N+1 with encoder N. */
+			GstBufferPool *pool = codecmm_pool_new(self->info.size, 2, &error);
 			if (pool) {
 				GST_OBJECT_LOCK(self);
 				self->repack_pool = pool;
 				gst_buffer_pool_set_flushing(pool, self->flushing);
 				GST_OBJECT_UNLOCK(self);
-				GST_INFO_OBJECT(self, "AMLY GPU conversion: codecmm P010 pitch=%zu pool=4", pitch);
+				GST_INFO_OBJECT(self, "AMLY GPU conversion: codecmm P010 pitch=%zu pool=2", pitch);
 			} else {
 				amly_gpu_free(self->gpu);
 				self->gpu = NULL;

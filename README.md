@@ -40,11 +40,13 @@ The native-HDR T7 configuration uses full-packed 4:2:2 and `no_swap_en=1`.
 then vertically averages chroma into P010. The Vulkan backend requires a real
 Mali-G52, external-memory DMA imports and the matching userspace driver. Select
 its private ICD before starting GStreamer; the board One-KVM launcher does so
-on 5.15. No global graphics-library links are changed. Four fixed codecmm slots
+on 5.15. No global graphics-library links are changed. Two fixed codecmm slots
 are allocated before the encoder's workspace; there is no unbounded CMA growth.
 Each GPU job completes and releases its temporary imports before returning the
 captured frame. The encoder must retain the output until its SDK reports input
-retirement. Pool flushing wakes a source blocked waiting for an output slot.
+retirement. This two-slot budget requires the current low-delay encoder SDK,
+which retires the submitted DMA input on each completed call. Pool flushing
+wakes a source blocked waiting for an output slot.
 
 When Vulkan or contiguous allocation is unavailable at startup, CPU conversion
 uses reusable system-memory buffers. `gpu-conversion=false` forces that path for
