@@ -29,15 +29,17 @@ static void dma_allocation(void)
     GstElement *source = gst_bin_get_by_name(GST_BIN(capture), "capture");
     g_assert_nonnull(source);
     GstPad *pad = gst_element_get_static_pad(source, "src");
-    GstCaps *caps = vim4_vdin1_caps("Hactive: 1920\nVactive: 1080\nFrame Rate: 6000\n", 0);
+    GstCaps *caps = vim4_vdin1_caps("Hactive: 3840\nVactive: 2160\nFrame Rate: 6000\n", 0);
     GstQuery *query = gst_query_new_allocation(caps, TRUE);
     g_assert_true(gst_pad_peer_query(pad, query));
     g_assert_true(gst_query_find_allocation_meta(query, GST_VIDEO_META_API_TYPE, NULL));
     guint bytes, minimum, maximum;
     gst_query_parse_nth_allocation_pool(query, 0, NULL, &bytes, &minimum, &maximum);
-    g_assert_cmpuint(bytes, >=, 1920 * 1080 * 3 / 2);
-    /* Queues and the simultaneous JPEG branch must not exhaust the raw pool. */
-    g_assert_cmpuint(minimum, >, 3 + 1);
+    g_assert_cmpuint(bytes, >=, 3840 * 2160 * 3 / 2);
+    /* v4l2src adds four slots. Leave room for the 200 MiB encoder workspace
+     * and reallocating VDIN0: the 4K raw pool must stay below 90 MiB. */
+    g_assert_cmpuint(minimum + 4, >=, 6);
+    g_assert_cmpuint((guint64)(minimum + 4) * bytes, <=, 90 * 1024 * 1024);
     g_assert_cmpuint(maximum, >=, minimum);
     gst_query_unref(query);
     gst_caps_unref(caps);

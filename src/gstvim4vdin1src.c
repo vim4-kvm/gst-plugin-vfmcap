@@ -58,10 +58,13 @@ static GstPadProbeReturn allocation(GstPad *pad, GstPadProbeInfo *probe, gpointe
         gst_query_parse_allocation(query, &caps, NULL);
         if (!caps || !gst_video_info_from_caps(&info, caps))
             return GST_PAD_PROBE_OK;
-        /* The DMA pool must outlive buffers held by the encoder/JPEG branches.
+        /* v4l2src adds the driver's two-buffer minimum and two working slots.
+         * Request two downstream slots, giving six total for the one-frame
+         * encoder/JPEG queues. Six here would request ten physical buffers and
+         * exhaust contiguous CMA after repeated HDMI mode changes.
          * VideoMeta keeps the real VDIN stride and offsets through downstream. */
         gst_query_add_allocation_meta(query, GST_VIDEO_META_API_TYPE, NULL);
-        gst_query_add_allocation_pool(query, NULL, info.size, 6, 8);
+        gst_query_add_allocation_pool(query, NULL, info.size, 2, 2);
         return GST_PAD_PROBE_HANDLED;
     }
     return GST_PAD_PROBE_OK;
