@@ -108,11 +108,13 @@ static void native_limit_preserves_input_dma(void)
     g_assert_cmpint(gst_harness_push(h, input), ==, GST_FLOW_OK);
     GstBuffer *output = gst_harness_pull(h);
     g_assert_true(gst_buffer_peek_memory(output, 0) == memory);
+    int fd = gst_dmabuf_memory_get_fd(memory);
     g_assert_cmpuint(calls, ==, before);
     g_assert_null(((GstVim4Scale *)element)->pool);
     g_assert_cmpuint(gst_buffer_get_video_meta(output)->width, ==, 1920);
     gst_buffer_unref(output);
     gst_harness_teardown(h);
+    g_assert_cmpint(fcntl(fd, F_GETFD), ==, -1);
 }
 
 int main(int argc, char **argv)

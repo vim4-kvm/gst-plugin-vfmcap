@@ -152,7 +152,9 @@ static GstFlowReturn prepare_output(GstBaseTransform *base, GstBuffer *input, Gs
 {
     GstVim4Scale *self = (GstVim4Scale *)base;
     if (gst_base_transform_is_passthrough(base)) {
-        *output = gst_buffer_ref(input);
+        /* BaseTransform transfers the existing reference when both buffers
+         * are identical. An extra reference would exhaust the capture pool. */
+        *output = input;
         return GST_FLOW_OK;
     }
     GstFlowReturn flow = gst_buffer_pool_acquire_buffer(self->pool, output, NULL);
