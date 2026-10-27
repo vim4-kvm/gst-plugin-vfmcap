@@ -3,8 +3,9 @@
 GStreamer source `vfmcapsrc` for the `vfm_cap` V4L2 device ([vim4-kvm/common_drivers](https://github.com/vim4-kvm/common_drivers) `drivers/media/vfm_cap`).
 
 Eight-bit frames are exported as DMA-buf straight from the vdin capture buffers
-and pushed downstream without copies. Packed ten-bit input uses CPU conversion
-to P010 for the separate Main10 encoder.
+and pushed downstream without copies. Packed ten-bit input uses Mali Vulkan
+conversion to contiguous P010 DMA buffers for the separate Main10 encoder,
+with the verified CPU converter as a startup fallback.
 
 The same plugin provides `vim4vdin1src` for the native-HDR 5.15 runtime:
 VDIN0 retains the display's HDR stream while VDIN1 captures independent NV21 SDR
@@ -25,7 +26,7 @@ duplicate frames, advertise VRR through EDID, or qualify hardware VRR support.
 ## Build
 
 ```sh
-sudo apt install libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev meson pkg-config
+sudo apt install libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev meson pkg-config libvulkan-dev glslang-tools
 meson setup build --buildtype=release --prefix=/usr && ninja -C build && meson test -C build && sudo ninja -C build install
 ```
 
@@ -36,13 +37,37 @@ must be in the vfm `tvpath` after `vdin0`. See the `vim4-kvm` repo `tools/hdmi-s
 
 The native-HDR T7 configuration uses full-packed 4:2:2 and `no_swap_en=1`.
 `AMLY` conversion unpacks little-endian Cb-Y-Cr-Y ten-bit slots (five bytes per pair),
-then vertically averages chroma into reusable P010 system-memory buffers.
-ARM64 NEON processes complete 32-pixel blocks; the scalar tail preserves padded
-rows. This path copies raw frames and requires cacheable read-only DMA mappings
-and DMA-BUF CPU synchronization. It does not apply a tone curve. Caps retain
+then vertically averages chroma into P010. The Vulkan backend requires a real
+Mali-G52, external-memory DMA imports and the matching userspace driver. Select
+its private ICD before starting GStreamer; the board One-KVM launcher does so
+on 5.15. No global graphics-library links are changed. Four fixed codecmm slots
+are allocated before the encoder's workspace; there is no unbounded CMA growth.
+Each GPU job completes and releases its temporary imports before returning the
+captured frame. The encoder must retain the output until its SDK reports input
+retirement. Pool flushing wakes a source blocked waiting for an output slot.
+
+When Vulkan or contiguous allocation is unavailable at startup, CPU conversion
+uses reusable system-memory buffers. `gpu-conversion=false` forces that path for
+comparisons. A GPU error after submission fails the stream instead of returning
+potentially incomplete pixels. ARM64 NEON processes complete 32-pixel blocks;
+the scalar tail preserves padded rows. CPU access requires cacheable read-only
+DMA mappings and DMA-BUF synchronization. Neither path applies a tone curve. Caps retain
 PQ/BT.2020 from the driver's V4L2 colorimetry; use the runtime GStreamer color
 parser because vendor and standard transfer-enum numeric values differ.
 HLG, twelve-bit and non-full-packed input have not been qualified.
+
+`amly-gpu-compare` is an exclusive hardware diagnostic, not an automatic test.
+Its default suite compares synthetic extreme/random samples, workgroup/NEON
+boundaries, unusual pitches, padding, 1440p/ultrawide and 4K byte-for-byte with
+the CPU converter. For an actual captured frame, including optional page padding:
+
+```sh
+VK_ICD_FILENAMES=/usr/lib/vim4-kvm/gpu/mali.json build/amly-gpu-compare --raw capture.amly 3840 2160 9600 7680 3
+```
+
+This replays the same frame and checks all output bytes/padding; it does not
+measure capture/encode/browser throughput. `VIM4_VIDEO_TIMING=1` also reports
+GPU import, dispatch, fence wait, and import destruction/idle every120frames.
 
 YUV444 requires the driver's `VUY3` extension and `no_swap_en=1`. VDIN writes
 Cr-Cb-Y bytes; the source reorders them into standard GStreamer `v308` (Y-Cb-Cr)
@@ -84,6 +109,7 @@ gst-launch-1.0 vfmcapsrc ! queue ! amlvenc bitrate=8000 ! video/x-h264 ! h264par
 | Property | Default | |
 |---|---|---|
 | `device` | `/dev/video_cap` | vfm_cap device node |
+| `gpu-conversion` | `true` | Try Mali conversion for packed ten-bit; startup failures fall back to CPU |
 
 On a source change (resolution/format) the element renegotiates caps. Timestamps are taken from the pipeline clock at dequeue time; caps carry `framerate=0/1` since the rate follows the HDMI source.
 

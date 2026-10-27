@@ -128,8 +128,9 @@ static gboolean run_frame(AmlyGpu *gpu, const char *raw_file, guint width,
             g_printerr("Reading raw frame: %s\n", error->message);
             goto cleanup;
         }
-        if (raw_size != input_bytes) {
-            g_printerr("Raw file has %zu bytes; expected exactly %" G_GUINT64_FORMAT "\n",
+        /* vfm_cap exports a page-aligned allocation, larger than visible rows. */
+        if (raw_size < input_bytes || raw_size > ((input_bytes + 4095) & ~(guint64)4095)) {
+            g_printerr("Raw file has %zu bytes; expected visible/page-aligned %" G_GUINT64_FORMAT "\n",
                         raw_size, input_bytes);
             goto cleanup;
         }

@@ -33,6 +33,10 @@
 #include "vuy24.h"
 #include "amly.h"
 #include "vdin1.h"
+#include "codecmm-pool.h"
+#ifdef HAVE_AMLY_GPU
+#include "amly-gpu.h"
+#endif
 
 /* vfm_cap extension: VDIN's packed Cr-Cb-Y output with no_swap_en=1. */
 #define V4L2_PIX_FMT_AML_VUY24 v4l2_fourcc('V', 'U', 'Y', '3')
@@ -58,6 +62,10 @@ struct _GstVfmCapSrc {
 	gboolean timing;
 	gboolean repack_vuy24;
 	gboolean repack_amly;
+	gboolean gpu_conversion;
+#ifdef HAVE_AMLY_GPU
+	AmlyGpu *gpu;
+#endif
 	guint input_size;
 	guint input_stride;
 
@@ -125,6 +133,7 @@ static void repack_amly(GstVfmCapSrc *self, uint8_t *output, const uint8_t *inpu
 enum {
 	PROP_0,
 	PROP_DEVICE,
+	PROP_GPU_CONVERSION,
 };
 
 static GstStaticPadTemplate src_template = GST_STATIC_PAD_TEMPLATE("src",
@@ -132,6 +141,22 @@ static GstStaticPadTemplate src_template = GST_STATIC_PAD_TEMPLATE("src",
 	GST_STATIC_CAPS(GST_VIDEO_CAPS_MAKE("{ NV21, NV12, UYVY, v308, P010_10LE }")));
 
 G_DEFINE_TYPE(GstVfmCapSrc, gst_vfmcap_src, GST_TYPE_PUSH_SRC);
+
+static void clear_repack(GstVfmCapSrc *self)
+{
+	GST_OBJECT_LOCK(self);
+	GstBufferPool *pool = g_steal_pointer(&self->repack_pool);
+	GST_OBJECT_UNLOCK(self);
+	if (pool) {
+		gst_buffer_pool_set_flushing(pool, TRUE);
+		gst_buffer_pool_set_active(pool, FALSE);
+		gst_object_unref(pool);
+	}
+#ifdef HAVE_AMLY_GPU
+	amly_gpu_free(self->gpu);
+	self->gpu = NULL;
+#endif
+}
 
 static GstVideoFormat
 fourcc_to_format(guint32 fourcc)
@@ -159,6 +184,9 @@ query_format(GstVfmCapSrc *self)
 	struct v4l2_format f = { .type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE };
 	struct v4l2_pix_format_mplane *mp = &f.fmt.pix_mp;
 	GstVideoFormat vfmt;
+	GstVideoInfo old = self->info;
+	guint old_size = self->input_size, old_stride = self->input_stride;
+	gboolean old_amly = self->repack_amly, old_vuy24 = self->repack_vuy24;
 
 	if (ioctl(self->fd, VIDIOC_G_FMT, &f) < 0) {
 		GST_WARNING_OBJECT(self, "G_FMT: %s", g_strerror(errno));
@@ -203,6 +231,12 @@ query_format(GstVfmCapSrc *self)
 	}
 	if (!self->repack_amly)
 		self->info.size = mp->plane_fmt[0].sizeimage;
+	else {
+		gsize pitch = ((gsize)mp->width * 2 + 63) & ~(gsize)63;
+		self->info.stride[0] = self->info.stride[1] = pitch;
+		self->info.offset[1] = pitch * mp->height;
+		self->info.size = pitch * mp->height * 3 / 2;
+	}
 	if (mp->colorspace == V4L2_COLORSPACE_REC709)
 		gst_video_colorimetry_from_string(&self->info.colorimetry, "bt709");
 	if (mp->colorspace == V4L2_COLORSPACE_BT2020 && mp->xfer_func != V4L2_XFER_FUNC_SMPTE2084) {
@@ -217,23 +251,60 @@ query_format(GstVfmCapSrc *self)
 		self->info.colorimetry.range = mp->quantization == V4L2_QUANTIZATION_FULL_RANGE ?
 			GST_VIDEO_COLOR_RANGE_0_255 : GST_VIDEO_COLOR_RANGE_16_235;
 	}
-	if (self->repack_pool) {
-		gst_buffer_pool_set_active(self->repack_pool, FALSE);
-		gst_clear_object(&self->repack_pool);
+	/* get_caps/negotiate can query repeatedly before the first frame. Keep the
+	 * same preallocated CMA slots unless geometry or colorimetry really changed. */
+	if (self->info_valid && old_size == self->input_size && old_stride == self->input_stride &&
+	    old_amly == self->repack_amly && old_vuy24 == self->repack_vuy24 &&
+	    gst_video_info_is_equal(&old, &self->info) && old.size == self->info.size &&
+	    (!(self->repack_amly || self->repack_vuy24) || self->repack_pool))
+		return TRUE;
+	clear_repack(self);
+#ifdef HAVE_AMLY_GPU
+	if (self->repack_amly && self->gpu_conversion) {
+		GError *error = NULL;
+		self->gpu = amly_gpu_new(&error);
+		if (self->gpu) {
+			gsize pitch = ((gsize)mp->width * 2 + 63) & ~(gsize)63;
+			GstBufferPool *pool = codecmm_pool_new(self->info.size, 4, &error);
+			if (pool) {
+				GST_OBJECT_LOCK(self);
+				self->repack_pool = pool;
+				gst_buffer_pool_set_flushing(pool, self->flushing);
+				GST_OBJECT_UNLOCK(self);
+				GST_INFO_OBJECT(self, "AMLY GPU conversion: codecmm P010 pitch=%zu pool=4", pitch);
+			} else {
+				amly_gpu_free(self->gpu);
+				self->gpu = NULL;
+			}
+		}
+		if (!self->gpu)
+			GST_WARNING_OBJECT(self, "AMLY GPU unavailable, using CPU conversion: %s",
+				error ? error->message : "initialization failed");
+		g_clear_error(&error);
 	}
+#endif
 	if (self->repack_vuy24 || self->repack_amly) {
 		GstStructure *config;
+		if (self->repack_pool)
+			goto pool_ready;
 		if (self->repack_amly && !self->repack_worker)
 			self->repack_worker = g_thread_pool_new(amly_worker, NULL, 1, FALSE, NULL);
-		self->repack_pool = gst_buffer_pool_new();
-		config = gst_buffer_pool_get_config(self->repack_pool);
+		GstBufferPool *pool = gst_buffer_pool_new();
+		config = gst_buffer_pool_get_config(pool);
 		/* Reuse touched pages instead of allocating/zeroing 25 MB per frame.
 		 * No maximum: downstream holding a buffer must not deadlock stop. */
 		gst_buffer_pool_config_set_params(config, NULL, self->info.size, 2, 0);
-		if (!gst_buffer_pool_set_config(self->repack_pool, config) ||
-		    !gst_buffer_pool_set_active(self->repack_pool, TRUE))
+		if (!gst_buffer_pool_set_config(pool, config) ||
+		    !gst_buffer_pool_set_active(pool, TRUE)) {
+			gst_object_unref(pool);
 			return FALSE;
+		}
+		GST_OBJECT_LOCK(self);
+		self->repack_pool = pool;
+		gst_buffer_pool_set_flushing(pool, self->flushing);
+		GST_OBJECT_UNLOCK(self);
 	}
+pool_ready:
 	self->info_valid = TRUE;
 	GST_INFO_OBJECT(self, "format %s %ux%u size %u",
 		gst_video_format_to_string(vfmt), mp->width, mp->height,
@@ -371,10 +442,7 @@ gst_vfmcap_src_stop(GstBaseSrc *bsrc)
 		close(self->fd);
 	self->fd = -1;
 	gst_clear_object(&self->allocator);
-	if (self->repack_pool) {
-		gst_buffer_pool_set_active(self->repack_pool, FALSE);
-		gst_clear_object(&self->repack_pool);
-	}
+	clear_repack(self);
 	return TRUE;
 }
 
@@ -429,14 +497,30 @@ gst_vfmcap_src_negotiate(GstBaseSrc *bsrc)
 static gboolean
 gst_vfmcap_src_unlock(GstBaseSrc *bsrc)
 {
-	GST_VFMCAP_SRC(bsrc)->flushing = TRUE;
+	GstVfmCapSrc *self = GST_VFMCAP_SRC(bsrc);
+	GST_OBJECT_LOCK(self);
+	self->flushing = TRUE;
+	GstBufferPool *pool = self->repack_pool ? gst_object_ref(self->repack_pool) : NULL;
+	GST_OBJECT_UNLOCK(self);
+	if (pool) {
+		gst_buffer_pool_set_flushing(pool, TRUE);
+		gst_object_unref(pool);
+	}
 	return TRUE;
 }
 
 static gboolean
 gst_vfmcap_src_unlock_stop(GstBaseSrc *bsrc)
 {
-	GST_VFMCAP_SRC(bsrc)->flushing = FALSE;
+	GstVfmCapSrc *self = GST_VFMCAP_SRC(bsrc);
+	GST_OBJECT_LOCK(self);
+	self->flushing = FALSE;
+	GstBufferPool *pool = self->repack_pool ? gst_object_ref(self->repack_pool) : NULL;
+	GST_OBJECT_UNLOCK(self);
+	if (pool) {
+		gst_buffer_pool_set_flushing(pool, FALSE);
+		gst_object_unref(pool);
+	}
 	return TRUE;
 }
 
@@ -540,11 +624,43 @@ gst_vfmcap_src_create(GstPushSrc *psrc, GstBuffer **outbuf)
 	gst_memory_resize(mem, 0, self->input_size);
 	gbuf = gst_buffer_new();
 	gst_buffer_append_memory(gbuf, mem);
+#ifdef HAVE_AMLY_GPU
+	if (self->gpu) {
+		GstBuffer *converted = NULL;
+		GstFlowReturn acquired = gst_buffer_pool_acquire_buffer(self->repack_pool, &converted, NULL);
+		if (acquired != GST_FLOW_OK) {
+			gst_buffer_unref(gbuf);
+			return acquired;
+		}
+		GstMemory *output = gst_buffer_peek_memory(converted, 0);
+		gsize capacity, offset;
+		gst_memory_get_sizes(output, &offset, &capacity);
+		GError *error = NULL;
+		gboolean ok = amly_gpu_convert(self->gpu, req.fd, req.size,
+			gst_dmabuf_memory_get_fd(output), capacity,
+			self->info.width, self->info.height, self->input_stride,
+			self->info.stride[0], &error);
+		/* GPU imports must be gone before dropping the captured frame fd. */
+		gst_buffer_unref(gbuf);
+		if (!ok) {
+			gst_buffer_unref(converted);
+			GST_ELEMENT_ERROR(self, RESOURCE, READ, ("AMLY GPU conversion failed"),
+				("%s", error ? error->message : "unknown GPU error"));
+			g_clear_error(&error);
+			return GST_FLOW_ERROR;
+		}
+		gbuf = converted;
+	} else
+#endif
 	if (self->repack_vuy24 || self->repack_amly) {
 		gint64 begin = self->timing ? g_get_monotonic_time() : 0;
 		GstMapInfo input = GST_MAP_INFO_INIT, output = GST_MAP_INFO_INIT;
 		GstBuffer *converted = NULL;
 		GstFlowReturn acquired = gst_buffer_pool_acquire_buffer(self->repack_pool, &converted, NULL);
+		if (acquired != GST_FLOW_OK) {
+			gst_buffer_unref(gbuf);
+			return acquired;
+		}
 		struct dma_buf_sync sync = { .flags = DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ };
 		gboolean synced = ioctl(req.fd, DMA_BUF_IOCTL_SYNC, &sync) == 0;
 		gboolean ok = acquired == GST_FLOW_OK && synced && gst_buffer_map(gbuf, &input, GST_MAP_READ) &&
@@ -621,6 +737,9 @@ gst_vfmcap_src_set_property(GObject *obj, guint id, const GValue *v,
 		g_free(self->device);
 		self->device = g_value_dup_string(v);
 		break;
+	case PROP_GPU_CONVERSION:
+		self->gpu_conversion = g_value_get_boolean(v);
+		break;
 	default:
 		G_OBJECT_WARN_INVALID_PROPERTY_ID(obj, id, pspec);
 	}
@@ -635,6 +754,9 @@ gst_vfmcap_src_get_property(GObject *obj, guint id, GValue *v,
 	switch (id) {
 	case PROP_DEVICE:
 		g_value_set_string(v, self->device);
+		break;
+	case PROP_GPU_CONVERSION:
+		g_value_set_boolean(v, self->gpu_conversion);
 		break;
 	default:
 		G_OBJECT_WARN_INVALID_PROPERTY_ID(obj, id, pspec);
@@ -668,6 +790,10 @@ gst_vfmcap_src_class_init(GstVfmCapSrcClass *klass)
 			DEFAULT_DEVICE,
 			G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS |
 			GST_PARAM_MUTABLE_READY));
+	g_object_class_install_property(gobject_class, PROP_GPU_CONVERSION,
+		g_param_spec_boolean("gpu-conversion", "GPU conversion",
+			"Use Mali compute and contiguous DMA for packed 10-bit input when available",
+			TRUE, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS | GST_PARAM_MUTABLE_READY));
 
 	gst_element_class_set_static_metadata(element_class,
 		"VFM capture source", "Source/Video",
@@ -690,6 +816,7 @@ gst_vfmcap_src_init(GstVfmCapSrc *self)
 {
 	self->device = g_strdup(DEFAULT_DEVICE);
 	self->fd = -1;
+	self->gpu_conversion = TRUE;
 	self->timing = g_strcmp0(g_getenv("VIM4_VIDEO_TIMING"), "1") == 0;
 	gst_base_src_set_live(GST_BASE_SRC(self), TRUE);
 	gst_base_src_set_format(GST_BASE_SRC(self), GST_FORMAT_TIME);

@@ -18,10 +18,31 @@ add_project_arguments(
   '-Wno-missing-field-initializers',
   language : 'c')
 
-library('gstvfmcap', ['src/gstvfmcapsrc.c', 'src/gstvim4vdin1src.c'],
+sources = ['src/gstvfmcapsrc.c', 'src/gstvim4vdin1src.c', 'src/codecmm-pool.c']
+gpu_dep = dependency('vulkan', required : false)
+if gpu_dep.found()
+  glslang = find_program('glslangValidator')
+  python = import('python').find_installation('python3')
+  spirv = custom_target('amly-spirv', input : 'src/amly-to-p010.comp',
+    output : 'amly-to-p010.spv', command : [glslang, '-V', '@INPUT@', '-o', '@OUTPUT@'])
+  shader_header = custom_target('amly-shader-header', input : spirv,
+    output : 'amly-to-p010-spirv.h',
+    command : [python, files('scripts/embed-spirv.py'), '@INPUT@', '@OUTPUT@'])
+  sources += ['src/amly-gpu.c', shader_header]
+  deps += [gpu_dep]
+  add_project_arguments('-DHAVE_AMLY_GPU=1', language : 'c')
+  # Uses contiguous DMA heaps and real Mali hardware; run only on the board.
+  executable('amly-gpu-compare', ['tests/amly-gpu-compare.c', 'src/amly-gpu.c', shader_header],
+    dependencies : deps, include_directories : include_directories('src', '.'))
+endif
+
+library('gstvfmcap', sources,
   dependencies : deps,
   install : true,
   install_dir : gst_dep.get_variable('pluginsdir'))
+
+test('codecmm-pool', executable('test-codecmm-pool', 'tests/test-codecmm-pool.c',
+  dependencies : deps, include_directories : include_directories('src')))
 
 test('vuy24-repack', executable('test-vuy24', 'tests/test-vuy24.c',
   include_directories : include_directories('src')))
