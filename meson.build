@@ -27,6 +27,11 @@ if ge2d.found()
 endif
 gpu_dep = dependency('vulkan', required : false)
 if gpu_dep.found()
+  add_project_arguments('-DHAVE_AMLY_GPU=1', language : 'c')
+  native_amly = meson.get_compiler('c').has_header('linux/amlogic-vdin.h')
+  if native_amly
+    add_project_arguments('-DHAVE_VIM4_AMLY_SOURCE=1', language : 'c')
+  endif
   glslang = find_program('glslangValidator')
   python = import('python').find_installation('python3')
   spirv = custom_target('amly-spirv', input : 'src/amly-to-p010.comp',
@@ -44,8 +49,13 @@ if gpu_dep.found()
   endforeach
   gpu_sources = ['src/amly-gpu.c', 'src/amly-gpu-scale.c', shader_header] + scale_headers
   sources += gpu_sources
+  if native_amly
+    sources += ['src/gstvim4amlysrc.c']
+    test('amly-source-rollback', executable('test-amly-source',
+      'tests/test-amly-source.c', dependencies : deps,
+      include_directories : include_directories('src')))
+  endif
   deps += [gpu_dep]
-  add_project_arguments('-DHAVE_AMLY_GPU=1', language : 'c')
   # Uses contiguous DMA heaps and real Mali hardware; run only on the board.
   executable('amly-gpu-compare', ['tests/amly-gpu-compare.c'] + gpu_sources,
     dependencies : deps, include_directories : include_directories('src', '.'))

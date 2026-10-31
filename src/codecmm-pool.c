@@ -78,6 +78,10 @@ GstBufferPool *codecmm_pool_new(gsize bytes, guint buffers, GError **error)
 	gst_object_ref_sink(pool);
 	self->bytes = bytes;
 	self->heap_fd = open("/dev/dma_heap/heap-codecmm", O_RDONLY | O_CLOEXEC);
+	if (self->heap_fd < 0)
+		self->heap_fd = open("/dev/dma_heap/reserved", O_RDONLY | O_CLOEXEC);
+	if (self->heap_fd < 0)
+		self->heap_fd = open("/dev/dma_heap/linux,cma", O_RDONLY | O_CLOEXEC);
 	if (!bytes || bytes > G_MAXUINT - 4095 || !buffers || self->heap_fd < 0)
 		goto failed;
 	GstStructure *config = gst_buffer_pool_get_config(pool);
@@ -89,7 +93,7 @@ GstBufferPool *codecmm_pool_new(gsize bytes, guint buffers, GError **error)
 	return pool;
 failed:
 	g_set_error(error, GST_RESOURCE_ERROR, GST_RESOURCE_ERROR_NO_SPACE_LEFT,
-		"Cannot allocate %u contiguous codecmm buffers of %zu bytes", buffers, bytes);
+		"Cannot allocate %u contiguous DMA buffers of %zu bytes", buffers, bytes);
 	gst_buffer_pool_set_active(pool, FALSE);
 	gst_object_unref(pool);
 	return NULL;

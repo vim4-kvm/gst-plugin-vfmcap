@@ -37,4 +37,15 @@ gboolean amly_gpu_convert_scaled(AmlyGpu *gpu, int input_fd, gsize input_size,
 
 void amly_gpu_free(AmlyGpu *gpu);
 
+/* As above, with an explicit luma storage height for codec-aligned P010.
+ * Visible samples use output_width/output_height; UV starts after
+ * output_stride_bytes * output_luma_rows. Padding is not visible video.
+ */
+gboolean amly_gpu_convert_padded(AmlyGpu *gpu, int input_fd, gsize input_size,
+                         int output_fd, gsize output_size,
+                         guint input_width, guint input_height,
+                         guint output_width, guint output_height,
+                         guint input_stride, guint output_stride_bytes,
+                         guint output_luma_rows, GError **error);
+
 #endif

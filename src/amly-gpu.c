@@ -19,6 +19,7 @@ typedef struct {
 typedef struct {
     guint32 width, height, input_stride, output_stride_words;
     guint32 input_width, input_height;
+    guint32 output_luma_rows;
 } ConvertParams;
 
 struct AmlyGpu {
@@ -41,6 +42,7 @@ struct AmlyGpu {
     VkFence fence;
     PFN_vkGetMemoryFdPropertiesKHR get_memory_fd_properties;
     gboolean failed;
+    gboolean external_queries_khr;
     gboolean timing;
     guint64 frames;
     double import_us, dispatch_us, wait_us, free_us;
@@ -97,8 +99,6 @@ static gboolean select_device(AmlyGpu *gpu, GError **error)
     g_free(devices);
     if (!gpu->physical)
         return invalid(error, "AMLY conversion requires the real ARM Mali-G52 GPU");
-    if (gpu->properties.apiVersion < VK_API_VERSION_1_1)
-        return invalid(error, "AMLY DMA import requires Vulkan 1.1 or newer");
 
     count = 0;
     vkGetPhysicalDeviceQueueFamilyProperties(gpu->physical, &count, NULL);
@@ -125,6 +125,8 @@ static gboolean select_device(AmlyGpu *gpu, GError **error)
 
 static gboolean create_device(AmlyGpu *gpu, GError **error)
 {
+    if (gpu->properties.apiVersion < VK_API_VERSION_1_1 && !gpu->external_queries_khr)
+        return invalid(error, "Vulkan 1.0 device requires KHR external-memory capabilities");
     guint count = 0;
     VkResult result = vkEnumerateDeviceExtensionProperties(gpu->physical, NULL,
                                                           &count, NULL);
@@ -138,9 +140,11 @@ static gboolean create_device(AmlyGpu *gpu, GError **error)
         return fail(error, "vkEnumerateDeviceExtensionProperties", result);
     }
     const char *extensions[] = {VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME,
-                               VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME};
+                               VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME,
+                               VK_KHR_EXTERNAL_MEMORY_EXTENSION_NAME};
+    guint extension_count = gpu->properties.apiVersion < VK_API_VERSION_1_1 ? 3 : 2;
     gboolean supported = TRUE;
-    for (guint i = 0; i < G_N_ELEMENTS(extensions); i++)
+    for (guint i = 0; i < extension_count; i++)
         supported &= has_extension(properties, count, extensions[i]);
     g_free(properties);
     if (!supported)
@@ -154,8 +158,15 @@ static gboolean create_device(AmlyGpu *gpu, GError **error)
     VkExternalBufferProperties external = {
         .sType = VK_STRUCTURE_TYPE_EXTERNAL_BUFFER_PROPERTIES,
     };
-    vkGetPhysicalDeviceExternalBufferProperties(gpu->physical, &external_info,
-                                                 &external);
+    const char *query_name = gpu->properties.apiVersion < VK_API_VERSION_1_1 ?
+        "vkGetPhysicalDeviceExternalBufferPropertiesKHR" :
+        "vkGetPhysicalDeviceExternalBufferProperties";
+    PFN_vkGetPhysicalDeviceExternalBufferProperties query_external =
+        (PFN_vkGetPhysicalDeviceExternalBufferProperties)
+        vkGetInstanceProcAddr(gpu->instance, query_name);
+    if (!query_external)
+        return invalid(error, "Vulkan device lacks external-memory capability queries");
+    query_external(gpu->physical, &external_info, &external);
     if (!(external.externalMemoryProperties.externalMemoryFeatures &
           VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT) ||
         !(external.externalMemoryProperties.compatibleHandleTypes &
@@ -173,7 +184,7 @@ static gboolean create_device(AmlyGpu *gpu, GError **error)
         .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
         .queueCreateInfoCount = 1,
         .pQueueCreateInfos = &queue,
-        .enabledExtensionCount = G_N_ELEMENTS(extensions),
+        .enabledExtensionCount = extension_count,
         .ppEnabledExtensionNames = extensions,
     };
     VkPhysicalDeviceFeatures available, enabled = {0};
@@ -293,6 +304,34 @@ AmlyGpu *amly_gpu_new(GError **error)
 {
     AmlyGpu *gpu = g_new0(AmlyGpu, 1);
     gpu->timing = g_strcmp0(g_getenv("VIM4_VIDEO_TIMING"), "1") == 0;
+    /* The G52 PanVK device reports 1.0. Enable the promoted instance aliases
+     * when available so its DMA capabilities can be queried through KHR.
+     * The vendor 1.1 device continues to use the core entry point.
+     */
+    guint count = 0;
+    VkResult result = vkEnumerateInstanceExtensionProperties(NULL, &count, NULL);
+    if (result != VK_SUCCESS) {
+        fail(error, "vkEnumerateInstanceExtensionProperties", result);
+        amly_gpu_free(gpu);
+        return NULL;
+    }
+    VkExtensionProperties *available = g_new(VkExtensionProperties, count);
+    result = vkEnumerateInstanceExtensionProperties(NULL, &count, available);
+    const char *extensions[2] = {0};
+    guint enabled = 0;
+    if (result == VK_SUCCESS && has_extension(available, count,
+            VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME) &&
+        has_extension(available, count, VK_KHR_EXTERNAL_MEMORY_CAPABILITIES_EXTENSION_NAME)) {
+        extensions[enabled++] = VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME;
+        extensions[enabled++] = VK_KHR_EXTERNAL_MEMORY_CAPABILITIES_EXTENSION_NAME;
+    }
+    g_free(available);
+    gpu->external_queries_khr = enabled == 2;
+    if (result != VK_SUCCESS) {
+        fail(error, "vkEnumerateInstanceExtensionProperties", result);
+        amly_gpu_free(gpu);
+        return NULL;
+    }
     VkApplicationInfo application = {
         .sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,
         .pApplicationName = "VIM4 AMLY converter",
@@ -301,8 +340,10 @@ AmlyGpu *amly_gpu_new(GError **error)
     VkInstanceCreateInfo instance = {
         .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
         .pApplicationInfo = &application,
+        .enabledExtensionCount = enabled,
+        .ppEnabledExtensionNames = extensions,
     };
-    VkResult result = vkCreateInstance(&instance, NULL, &gpu->instance);
+    result = vkCreateInstance(&instance, NULL, &gpu->instance);
     if (result != VK_SUCCESS) {
         fail(error, "vkCreateInstance", result);
         amly_gpu_free(gpu);
@@ -459,7 +500,7 @@ static gboolean record_commands(AmlyGpu *gpu, ImportedBuffer *input,
     if (params->width != params->input_width || params->height != params->input_height) {
         amly_gpu_scaler_record(gpu->scaler, gpu->command, input->buffer, input_range,
             output->buffer, output_range, params->width, params->height,
-            params->input_stride, params->output_stride_words);
+            params->input_stride, params->output_stride_words, params->output_luma_rows);
     } else {
         vkCmdBindPipeline(gpu->command, VK_PIPELINE_BIND_POINT_COMPUTE, gpu->pipeline);
         vkCmdBindDescriptorSets(gpu->command, VK_PIPELINE_BIND_POINT_COMPUTE,
@@ -488,18 +529,30 @@ gboolean amly_gpu_convert_scaled(AmlyGpu *gpu, int input_fd, gsize input_size,
                          guint width, guint height, guint input_stride,
                          guint output_stride_bytes, GError **error)
 {
+    return amly_gpu_convert_padded(gpu, input_fd, input_size, output_fd, output_size,
+        input_width, input_height, width, height, input_stride, output_stride_bytes,
+        height, error);
+}
+
+gboolean amly_gpu_convert_padded(AmlyGpu *gpu, int input_fd, gsize input_size,
+                         int output_fd, gsize output_size,
+                         guint input_width, guint input_height,
+                         guint width, guint height, guint input_stride,
+                         guint output_stride_bytes, guint output_luma_rows, GError **error)
+{
     if (!gpu || gpu->failed)
         return invalid(error, "AMLY GPU instance is unavailable after a device error");
     if (input_fd < 0 || output_fd < 0 || input_fd == output_fd ||
         !width || !height || (width & 1) || (height & 1) ||
         !input_width || !input_height || (input_width & 1) || (input_height & 1) ||
-        width > input_width || height > input_height ||
+        width > input_width || height > input_height || output_luma_rows < height ||
+        (output_luma_rows & 1) ||
         (guint64)input_stride < (guint64)input_width * 5 / 2 ||
         (guint64)output_stride_bytes < (guint64)width * 2 ||
         output_stride_bytes % 16)
         return invalid(error, "AMLY conversion requires distinct DMA fds, even geometry and valid pitches");
     guint64 input_range = ((guint64)input_stride * input_height + 3) & ~(guint64)3;
-    guint64 output_luma_size = (guint64)output_stride_bytes * height;
+    guint64 output_luma_size = (guint64)output_stride_bytes * output_luma_rows;
     if (input_range > G_MAXUINT32 || output_luma_size > G_MAXUINT32)
         return invalid(error, "AMLY shader byte offsets exceed 32-bit addressing");
     guint64 output_range = output_luma_size * 3 / 2;
@@ -535,7 +588,7 @@ gboolean amly_gpu_convert_scaled(AmlyGpu *gpu, int input_fd, gsize input_size,
     if (gpu->timing)
         t1 = g_get_monotonic_time();
     ConvertParams params = {width, height, input_stride, output_stride_bytes / 4,
-                            input_width, input_height};
+                            input_width, input_height, output_luma_rows};
     if (!record_commands(gpu, &input, &output, input_range, output_range,
                            &params, error))
         goto cleanup;

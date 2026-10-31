@@ -23,6 +23,7 @@ struct AmlyGpuScaler {
 
 typedef struct {
     guint32 width, height, input_width, input_height, input_stride, output_stride_words;
+    guint32 output_luma_rows;
 } ScaleParams;
 
 static gboolean check(VkResult result, const char *operation, GError **error)
@@ -191,7 +192,8 @@ fail:
 
 void amly_gpu_scaler_record(AmlyGpuScaler *s, VkCommandBuffer command,
     VkBuffer input, VkDeviceSize input_range, VkBuffer output, VkDeviceSize output_range,
-    guint width, guint height, guint input_stride, guint output_stride_words)
+    guint width, guint height, guint input_stride, guint output_stride_words,
+    guint output_luma_rows)
 {
     VkDescriptorBufferInfo buffers[] = {{input, 0, input_range}, {output, 0, output_range}};
     VkDescriptorImageInfo images[] = {
@@ -231,7 +233,8 @@ void amly_gpu_scaler_record(AmlyGpuScaler *s, VkCommandBuffer command,
     }
     vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
         0, 0, NULL, 0, NULL, 2, barriers);
-    ScaleParams params = {width, height, s->width, s->height, input_stride, output_stride_words};
+    ScaleParams params = {width, height, s->width, s->height, input_stride,
+        output_stride_words, output_luma_rows};
     for (guint pass = 0; pass < 2; pass++) {
         vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_COMPUTE, s->pipelines[pass]);
         vkCmdBindDescriptorSets(command, VK_PIPELINE_BIND_POINT_COMPUTE, s->layouts[pass],

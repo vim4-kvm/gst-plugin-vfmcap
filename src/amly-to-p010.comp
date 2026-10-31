@@ -11,6 +11,7 @@ layout(push_constant) uniform Params {
     uint height;
     uint input_stride_bytes;
     uint output_stride_words;
+    uint input_width, input_height, output_luma_rows;
 } p;
 
 uint read_le32(uint offset)
@@ -48,7 +49,7 @@ void main()
     dst.words[y] = (top.y << 6) | (top.w << 22);
     dst.words[y + p.output_stride_words] = (bottom.y << 6) | (bottom.w << 22);
 
-    uint uv = p.output_stride_words * p.height +
+    uint uv = p.output_stride_words * p.output_luma_rows +
               (row / 2u) * p.output_stride_words + pair;
     // Match the CPU NEON vrhadd, including rounding odd sums upward.
     uint cb = (top.x + bottom.x + 1u) >> 1;

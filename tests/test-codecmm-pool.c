@@ -6,14 +6,19 @@
 #include <sys/mman.h>
 #include <unistd.h>
 #include <errno.h>
+#include <string.h>
 #include <linux/dma-heap.h>
 #include <gst/gst.h>
 
 static int allocated[16], allocated_count, fail_at = -1, heap_fd;
+static const char *available_heap = "/dev/dma_heap/heap-codecmm";
 static int fake_open(const char *path, int flags)
 {
-	(void)path;
 	(void)flags;
+	if (!available_heap || strcmp(path, available_heap)) {
+		errno = ENOENT;
+		return -1;
+	}
 	heap_fd = open("/dev/null", O_RDONLY | O_CLOEXEC);
 	return heap_fd;
 }
@@ -106,6 +111,28 @@ static void bounded_flush_and_outstanding_lifetime(void)
 	g_assert_cmpint(fcntl(heap_fd, F_GETFD), ==, -1);
 }
 
+static void contiguous_heap_compatibility(void)
+{
+	const char *heaps[] = { "/dev/dma_heap/reserved", "/dev/dma_heap/linux,cma" };
+	for (guint i = 0; i < G_N_ELEMENTS(heaps); i++) {
+		available_heap = heaps[i];
+		allocated_count = 0;
+		fail_at = -1;
+		GstBufferPool *pool = codecmm_pool_new(4096, 2, NULL);
+		g_assert_nonnull(pool);
+		gst_buffer_pool_set_active(pool, FALSE);
+		gst_object_unref(pool);
+		g_assert_cmpint(fcntl(heap_fd, F_GETFD), ==, -1);
+	}
+	available_heap = NULL;
+	allocated_count = 0;
+	GError *error = NULL;
+	g_assert_null(codecmm_pool_new(4096, 2, &error));
+	g_assert_cmpint(allocated_count, ==, 0);
+	g_clear_error(&error);
+	available_heap = "/dev/dma_heap/heap-codecmm";
+}
+
 static void partial_allocation_failure(void)
 {
 	allocated_count = 0;
@@ -124,5 +151,6 @@ int main(int argc, char **argv)
 	g_test_init(&argc, &argv, NULL);
 	g_test_add_func("/codecmm/bounded-flush-and-lifetime", bounded_flush_and_outstanding_lifetime);
 	g_test_add_func("/codecmm/partial-allocation-failure", partial_allocation_failure);
+	g_test_add_func("/codecmm/contiguous-heap-compatibility", contiguous_heap_compatibility);
 	return g_test_run();
 }

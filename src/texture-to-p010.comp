@@ -6,6 +6,7 @@ layout(set = 0, binding = 1) uniform sampler2D chroma;
 layout(set = 0, binding = 2, std430) writeonly buffer Output { uint words[]; } dst;
 layout(push_constant) uniform Params {
     uint width, height, input_width, input_height, input_stride, output_stride_words;
+    uint output_luma_rows;
 } p;
 
 uint sample_luma(vec2 at)
@@ -29,6 +30,6 @@ void main()
     uvec2 uv = uvec2(textureLod(chroma,
         vec2(float(pair) + 0.5, float(row) + 1.0) / vec2(p.width / 2u, p.height),
         0.0).rg + 0.5);
-    offset = p.output_stride_words * p.height + row / 2u * p.output_stride_words + pair;
+    offset = p.output_stride_words * p.output_luma_rows + row / 2u * p.output_stride_words + pair;
     dst.words[offset] = (uv.x << 6) | (uv.y << 22);
 }

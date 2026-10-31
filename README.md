@@ -7,6 +7,41 @@ and pushed downstream without copies. Packed ten-bit input uses Mali Vulkan
 conversion to contiguous P010 DMA buffers for the separate Main10 encoder,
 with the verified CPU converter as a startup fallback.
 
+## Native HDR capture on the experimental V4L2 backend
+
+When built with the exported `linux/amlogic-vdin.h` UAPI header and Vulkan,
+`vim4amlysrc` negotiates the private **AMLY** format with the T7 capture driver.
+AMLY remains packed 4:2:2 ten-bit input; the source publishes P010 only after
+the Vulkan converter has completed. It never maps pixels or falls back to CPU.
+The existing `vfmcapsrc` behavior on 5.15 remains available separately.
+
+The capture queue owns four exported DMA buffers. Each frame is requeued only
+after its GPU fence has completed. Three separate contiguous P010 buffers form
+the downstream pool; flush wakes pool acquisition and capture polling. A GPU
+failure ends the stream. `width=0 height=0` keeps native dimensions; explicit
+even dimensions request GPU downscaling and cannot exceed the source.
+VideoMeta carries the actual pitch, UV offset and storage padding. Wave5 output
+storage uses 32-pixel rows and a 16-row luma height, independently of visible
+geometry. Buffer size covers that storage and allocation capacity also includes
+page rounding.
+
+Both kernels use the same shader sources: `src/amly-to-p010.comp`, with
+`src/amly-to-texture.comp` and `src/texture-to-p010.comp` for scaling. Vulkan 1.1
+uses core external-memory queries; Vulkan 1.0 requires the equivalent KHR
+instance/device extensions. Missing DMA-buf capabilities fail explicitly, and
+software devices are rejected. These checks establish API requirements, not
+hardware acceptance on both kbase and Panfrost.
+
+Export only the new UAPI header into a private include directory, then pass its
+parent as `CFLAGS=-I/path/to/private-uapi` when configuring Meson. Without the
+header this source is not built or registered. Private standard video4linux2
+also needs the companion P010 mapping patch. The source returns PQ/BT.2020
+limited-range data; the consumer must read current HDR10 metadata from the
+capture node's standard compound controls and insert static SEI as appropriate.
+Do not interpret this stream as an SDR JPEG source.
+
+## Existing 5.15 capture and scaling
+
 The same plugin provides `vim4vdin1src` for the native-HDR 5.15 runtime:
 VDIN0 retains the display's HDR stream while VDIN1 captures independent NV21 SDR
 from the same HDMI receiver. The board launcher sets `VIM4_SECONDARY_HDMI_CAPTURE=1`

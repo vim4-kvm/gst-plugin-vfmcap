@@ -6,6 +6,7 @@ layout(set = 0, binding = 1, r16f) uniform writeonly image2D luma;
 layout(set = 0, binding = 2, rg16f) uniform writeonly image2D chroma;
 layout(push_constant) uniform Params {
     uint width, height, input_width, input_height, input_stride, output_stride_words;
+    uint output_luma_rows;
 } p;
 
 uint read_le32(uint offset)
