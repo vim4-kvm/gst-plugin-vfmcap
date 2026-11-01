@@ -61,10 +61,56 @@ static void live_curve_preferences(void)
     g_assert_cmpuint(filter->white, ==, 300); g_assert_cmpuint(filter->peak, ==, 1200);
     gst_object_unref(filter);
 }
+
+static void released(gpointer count, GstMiniObject *object)
+{
+    (void)object;
+    g_atomic_int_inc((gint *)count);
+}
+
+static void nv12_buffers_return_to_capture(void)
+{
+    gint returned = 0;
+    GstElement *pipeline = gst_pipeline_new(NULL);
+    GstElement *source = gst_element_factory_make("appsrc", NULL);
+    GstElement *filter = g_object_new(gst_vim4_pq2sdr_get_type(), NULL);
+    GstElement *sink = gst_element_factory_make("fakesink", NULL);
+    g_assert_nonnull(source); g_assert_nonnull(sink);
+    GstCaps *caps = gst_caps_from_string("video/x-raw,format=NV12,width=640,height=360,colorimetry=bt709,framerate=60/1");
+    g_object_set(source, "caps", caps, "format", GST_FORMAT_TIME, "max-bytes", (guint64)0, NULL);
+    g_object_set(sink, "sync", FALSE, "enable-last-sample", FALSE, NULL);
+    gst_caps_unref(caps);
+    gst_bin_add_many(GST_BIN(pipeline), source, filter, sink, NULL);
+    g_assert_true(gst_element_link_many(source, filter, sink, NULL));
+    g_assert_cmpint(gst_element_set_state(pipeline, GST_STATE_PLAYING), !=, GST_STATE_CHANGE_FAILURE);
+    for (guint i = 0; i < 60; i++) {
+        GstBuffer *buffer = gst_buffer_new_allocate(NULL, 640 * 360 * 3 / 2, NULL);
+        GST_BUFFER_PTS(buffer) = i * GST_SECOND / 60;
+        GST_BUFFER_DURATION(buffer) = GST_SECOND / 60;
+        gst_mini_object_weak_ref(GST_MINI_OBJECT(buffer), released, &returned);
+        GstFlowReturn flow;
+        g_signal_emit_by_name(source, "push-buffer", buffer, &flow);
+        gst_buffer_unref(buffer);
+        g_assert_cmpint(flow, ==, GST_FLOW_OK);
+    }
+    GstFlowReturn flow;
+    g_signal_emit_by_name(source, "end-of-stream", &flow);
+    g_assert_cmpint(flow, ==, GST_FLOW_OK);
+    GstBus *bus = gst_element_get_bus(pipeline);
+    GstMessage *message = gst_bus_timed_pop_filtered(bus, 10 * GST_SECOND, GST_MESSAGE_EOS | GST_MESSAGE_ERROR);
+    g_assert_nonnull(message);
+    g_assert_cmpint(GST_MESSAGE_TYPE(message), ==, GST_MESSAGE_EOS);
+    gst_message_unref(message); gst_object_unref(bus);
+    gst_element_set_state(pipeline, GST_STATE_NULL);
+    gst_object_unref(pipeline);
+    g_assert_cmpint(g_atomic_int_get(&returned), ==, 60);
+    g_assert_cmpuint(contexts, ==, 0); g_assert_cmpuint(submissions, ==, 0);
+}
 int main(int argc, char **argv)
 {
     gst_init(&argc, &argv); g_test_init(&argc, &argv, NULL);
     g_test_add_func("/pq2sdr/negotiation-and-rollback", negotiation_and_rollback);
     g_test_add_func("/pq2sdr/live-curve-preferences", live_curve_preferences);
+    g_test_add_func("/pq2sdr/nv12-buffers-return-to-capture", nv12_buffers_return_to_capture);
     return g_test_run();
 }

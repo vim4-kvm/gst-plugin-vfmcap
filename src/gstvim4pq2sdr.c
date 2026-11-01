@@ -125,7 +125,10 @@ static gboolean set_caps(GstBaseTransform *base, GstCaps *input, GstCaps *output
 static GstFlowReturn prepare(GstBaseTransform *base, GstBuffer *input, GstBuffer **output)
 {
     GstVim4Pq2Sdr *self = (GstVim4Pq2Sdr *)base;
-    if (gst_base_transform_is_passthrough(base)) { *output = gst_buffer_ref(input); return GST_FLOW_OK; }
+    /* Passthrough forwards the input's existing ownership. BaseTransform
+     * does not unref it a second time when input == output; an extra ref
+     * here pins every VDIN buffer and eventually stops both tee branches. */
+    if (gst_base_transform_is_passthrough(base)) { *output = input; return GST_FLOW_OK; }
     GstFlowReturn result = gst_buffer_pool_acquire_buffer(self->pool, output, NULL);
     if (result != GST_FLOW_OK) return result;
     gsize offsets[GST_VIDEO_MAX_PLANES] = {0, (gsize)self->stride * self->input.height};
