@@ -10,6 +10,14 @@ typedef struct AmlyGpu AmlyGpu;
  * ICD selection belongs to the launcher, before the Vulkan loader is used. */
 AmlyGpu *amly_gpu_new(GError **error);
 
+/* A separate context/pipeline for the SDR branch. It borrows P010 DMA only
+ * while dispatched; the live encoder continues to own the original samples. */
+AmlyGpu *amly_gpu_new_tonemap(GError **error);
+gboolean amly_gpu_tonemap(AmlyGpu *gpu, int input_fd, gsize input_size,
+                         int output_fd, gsize output_size, guint width, guint height,
+                         guint input_stride, guint input_luma_rows, guint output_stride,
+                         float white, float peak, GError **error);
+
 /* Convert little-endian full-packed AMLY 4:2:2 to standard high-bit P010.
  * Strides are bytes; sizes are the actual DMA allocation capacities, including
  * alignment padding. Input and output must be distinct DMA allocations.

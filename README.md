@@ -40,6 +40,36 @@ limited-range data; the consumer must read current HDR10 metadata from the
 capture node's standard compound controls and insert static SEI as appropriate.
 Do not interpret this stream as an SDR JPEG source.
 
+### SDR branch candidate
+
+`vim4pq2sdr` accepts the native source's single-fd, padded P010 VideoMeta and
+produces separate NV12 DMA buffers using Vulkan. It uses the same external
+memory/fence ownership as AMLY conversion, with a bounded two-buffer output
+pool. NV12/BT.709 input passes through; PQ with another format, range or
+primaries is rejected. There is no CPU pixel conversion or upload fallback.
+It reads the global `HDR_SDR_WHITE`/`HDR_SDR_PEAK` preferences once per second;
+explicit `sdr-white`/`hdr-peak` properties override those values. The edge
+logarithmic highlight curve preserves the sRGB midtones, with a BT.2020-to-709
+gamut conversion and limited-range NV12 output for JPEG/video conversion.
+
+The live Main10 encoder continues to receive the original P010. Screenshots
+open a valve on this same capture only for one fresh frame, then tone map it
+before ordinary SDR JPEG scaling/compression. Continuous JPEG consumers use a
+leaky one-frame raw queue. Neither path opens VDIN again. A GPU failure ends
+the affected pipeline; no incomplete output is handed back to consumers.
+CPU JPEG conversion maps only the resulting SDR buffer via the standard
+[GStreamer DMA-buf allocator](https://github.com/GStreamer/gstreamer/blob/1.24.2/subprojects/gst-plugins-base/gst-libs/gst/allocators/gstdmabuf.c),
+which issues CPU-access synchronization on map/unmap.
+
+For offline arithmetic checks, build `pq-sdr-probe`, explicitly select a
+software Vulkan ICD and run `python3 tests/pq-sdr-compare.py build OUTPUT`.
+It compares the actual SPIR-V to a double-precision reference, checks poisoned
+row padding and padded UV offsets, and saves fixtures/results. It does not
+qualify board DMA import, cache ownership or either GPU stack's throughput.
+Meson also tests negotiation, global-curve changes and failed-start cleanup
+without a GPU. Native source height-only requests preserve aspect ratio and
+never upscale; explicit dimension pairs retain the exact geometry contract.
+
 ## Existing 5.15 capture and scaling
 
 The same plugin provides `vim4vdin1src` for the native-HDR 5.15 runtime:

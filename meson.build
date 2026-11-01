@@ -40,7 +40,7 @@ if gpu_dep.found()
     output : 'amly-to-p010-spirv.h',
     command : [python, files('scripts/embed-spirv.py'), '@INPUT@', '@OUTPUT@'])
   scale_headers = []
-  foreach name : ['amly-to-texture', 'texture-to-p010']
+  foreach name : ['amly-to-texture', 'texture-to-p010', 'p010-to-sdr']
     scale_spirv = custom_target(name + '-spirv', input : 'src/' + name + '.comp',
       output : name + '.spv', command : [glslang, '-V', '-Os', '@INPUT@', '-o', '@OUTPUT@'])
     scale_headers += custom_target(name + '-header', input : scale_spirv,
@@ -49,16 +49,20 @@ if gpu_dep.found()
   endforeach
   gpu_sources = ['src/amly-gpu.c', 'src/amly-gpu-scale.c', shader_header] + scale_headers
   sources += gpu_sources
+  sources += ['src/gstvim4pq2sdr.c']
+  test('pq-sdr-contract', executable('test-pq2sdr', 'tests/test-pq2sdr.c',
+    dependencies : deps, include_directories : include_directories('src')))
   if native_amly
     sources += ['src/gstvim4amlysrc.c']
     test('amly-source-rollback', executable('test-amly-source',
       'tests/test-amly-source.c', dependencies : deps,
       include_directories : include_directories('src')))
   endif
-  deps += [gpu_dep]
+  deps += [gpu_dep, meson.get_compiler('c').find_library('m')]
   # Uses contiguous DMA heaps and real Mali hardware; run only on the board.
   executable('amly-gpu-compare', ['tests/amly-gpu-compare.c'] + gpu_sources,
     dependencies : deps, include_directories : include_directories('src', '.'))
+  executable('pq-sdr-probe', 'tests/pq-sdr-probe.c', dependencies : deps)
 endif
 
 library('gstvfmcap', sources,

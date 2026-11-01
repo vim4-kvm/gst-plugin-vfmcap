@@ -1,0 +1,78 @@
+// SPDX-License-Identifier: LGPL-2.1-or-later
+#version 450
+layout(local_size_x = 64) in;
+layout(set=0, binding=0, std430) readonly buffer Input { uint words[]; } src;
+layout(set=0, binding=1, std430) writeonly buffer Output { uint words[]; } dst;
+layout(push_constant) uniform Params {
+    uint width, height, input_stride, output_stride_words;
+    uint input_width, input_height, output_luma_rows, input_luma_rows;
+    float white, peak, shoulder;
+} p;
+
+float code(uint x, uint y, uint channel)
+{
+    x = min(x, p.width - 1u); y = min(y, p.height - 1u);
+    uint offset = channel == 0u ? y * (p.input_stride / 2u) + x :
+        p.input_luma_rows * (p.input_stride / 2u) + (y / 2u) * (p.input_stride / 2u) + (x / 2u) * 2u + channel - 1u;
+    return float((src.words[offset / 2u] >> ((offset % 2u) * 16u + 6u)) & 1023u);
+}
+vec3 pq(vec3 value)
+{
+    vec3 v = pow(clamp(value, 0.0, 1.0), vec3(32.0/2523.0));
+    return 10000.0 * pow(max(v - 3424.0/4096.0, 0.0) /
+        (2413.0/128.0 - 2392.0/128.0 * v), vec3(16384.0/2610.0));
+}
+float decode(float value)
+{ return value <= .04045 ? value / 12.92 : pow((value + .055) / 1.055, 2.4); }
+vec3 encode(vec3 value)
+{
+    value = clamp(value, 0.0, 1.0);
+    return mix(1.055 * pow(value, vec3(1.0/2.4)) - .055, 12.92 * value,
+        lessThanEqual(value, vec3(.0031308)));
+}
+vec3 pixel(uint x, uint y, float shoulder)
+{
+    float luma = (code(x,y,0u) - 64.0) / 876.0;
+    float cb = (code(x,y,1u) - 512.0) / 896.0;
+    float cr = (code(x,y,2u) - 512.0) / 896.0;
+    float r = luma + 1.4746 * cr, b = luma + 1.8814 * cb;
+    vec3 linear = pq(vec3(r, (luma - .2627*r - .0593*b) / .6780, b));
+    vec3 rgb = vec3(dot(linear, vec3(1.660491,-.587641,-.072850)),
+                    dot(linear, vec3(-.124550,1.132900,-.008349)),
+                    dot(linear, vec3(-.018151,-.100579,1.118730))) / p.white;
+    // Match the edge HDR2 curve: preserve sRGB through .9, use a log
+    // shoulder up to the configured peak. Scale RGB together to retain hue.
+    float level = max(max(rgb.r, rgb.g), rgb.b), knee = decode(.9);
+    if (level > knee) {
+        float top = p.peak / p.white;
+        float encoded = .9 + .1 * log(1.0 + shoulder * (min(level, top) - knee)) /
+            log(1.0 + shoulder * (top - knee));
+        rgb *= decode(encoded) / level;
+    }
+    rgb = encode(rgb);
+    float y709 = dot(rgb, vec3(.2126,.7152,.0722));
+    return vec3(16.0+219.0*y709, 128.0+224.0*(rgb.b-y709)/1.8556,
+                128.0+224.0*(rgb.r-y709)/1.5748);
+}
+uint quantize(float value) { return uint(clamp(floor(value + .5), 0.0, 255.0)); }
+void main()
+{
+    uint x = gl_GlobalInvocationID.x * 4u, y = gl_GlobalInvocationID.y * 2u;
+    if (x >= p.width || y >= p.height) return;
+    vec3 pixels[8];
+    for (uint row=0u; row<2u; row++) {
+        uint packed=0u;
+        for (uint col=0u; col<4u; col++) {
+            pixels[row*4u+col] = pixel(x+col, y+row, p.shoulder);
+            packed |= quantize(pixels[row*4u+col].x) << (col*8u);
+        }
+        dst.words[(y+row)*p.output_stride_words+x/4u] = packed;
+    }
+    uint packed=0u;
+    for (uint pair=0u; pair<2u; pair++) {
+        vec3 uv=(pixels[pair*2u]+pixels[pair*2u+1u]+pixels[4u+pair*2u]+pixels[5u+pair*2u])*.25;
+        packed |= quantize(uv.y) << (pair*16u);
+        packed |= quantize(uv.z) << (pair*16u+8u);
+    }
+    dst.words[(p.output_luma_rows+y/2u)*p.output_stride_words+x/4u] = packed;
+}

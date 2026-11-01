@@ -120,5 +120,18 @@ int main(int argc, char **argv)
         g_assert_cmpuint(descriptors, ==, 0);
         g_assert_cmpuint(contexts, ==, 0);
     }
+    const guint ceilings[][3] = {{240,320,240}, {450,600,450}, {720,640,480}};
+    for (guint i = 0; i < G_N_ELEMENTS(ceilings); i++) {
+        expected_output_bytes = GST_ROUND_UP_64(ceilings[i][1] * 2) *
+            GST_ROUND_UP_16(ceilings[i][2]) * 3 / 2;
+        GstVim4AmlySrc *source = g_object_new(gst_vim4_amly_src_get_type(), "height", ceilings[i][0], NULL);
+        gst_object_ref_sink(source);
+        g_assert_cmpint(gst_element_set_state(GST_ELEMENT(source), GST_STATE_PAUSED), !=, GST_STATE_CHANGE_FAILURE);
+        g_assert_cmpuint(source->output.width, ==, ceilings[i][1]);
+        g_assert_cmpuint(source->output.height, ==, ceilings[i][2]);
+        gst_element_set_state(GST_ELEMENT(source), GST_STATE_NULL);
+        gst_object_unref(source);
+        g_assert_cmpuint(descriptors, ==, 0); g_assert_cmpuint(contexts, ==, 0);
+    }
     return 0;
 }

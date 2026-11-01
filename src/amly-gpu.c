@@ -2,9 +2,11 @@
 #include "amly-gpu.h"
 #include "amly-gpu-scale.h"
 #include "amly-to-p010-spirv.h"
+#include "p010-to-sdr-spirv.h"
 
 #include <errno.h>
 #include <fcntl.h>
+#include <math.h>
 #include <string.h>
 #include <unistd.h>
 #include <vulkan/vulkan.h>
@@ -20,6 +22,8 @@ typedef struct {
     guint32 width, height, input_stride, output_stride_words;
     guint32 input_width, input_height;
     guint32 output_luma_rows;
+    guint32 input_luma_rows;
+    float white, peak, shoulder;
 } ConvertParams;
 
 struct AmlyGpu {
@@ -44,6 +48,9 @@ struct AmlyGpu {
     gboolean failed;
     gboolean external_queries_khr;
     gboolean timing;
+    gboolean tonemap;
+    guint input_luma_rows;
+    float white, peak, shoulder;
     guint64 frames;
     double import_us, dispatch_us, wait_us, free_us;
 };
@@ -236,8 +243,8 @@ static gboolean create_pipeline(AmlyGpu *gpu, GError **error)
         return fail(error, "vkCreatePipelineLayout", result);
     VkShaderModuleCreateInfo shader_info = {
         .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
-        .codeSize = sizeof(amly_to_p010_spirv),
-        .pCode = amly_to_p010_spirv,
+        .codeSize = gpu->tonemap ? sizeof(p010_to_sdr_spirv) : sizeof(amly_to_p010_spirv),
+        .pCode = gpu->tonemap ? p010_to_sdr_spirv : amly_to_p010_spirv,
     };
     VkShaderModule shader = VK_NULL_HANDLE;
     result = vkCreateShaderModule(gpu->device, &shader_info, NULL, &shader);
@@ -300,9 +307,10 @@ static gboolean create_pipeline(AmlyGpu *gpu, GError **error)
     return result == VK_SUCCESS || fail(error, "vkCreateFence", result);
 }
 
-AmlyGpu *amly_gpu_new(GError **error)
+static AmlyGpu *new_converter(gboolean tonemap, GError **error)
 {
     AmlyGpu *gpu = g_new0(AmlyGpu, 1);
+    gpu->tonemap = tonemap;
     gpu->timing = g_strcmp0(g_getenv("VIM4_VIDEO_TIMING"), "1") == 0;
     /* The G52 PanVK device reports 1.0. Enable the promoted instance aliases
      * when available so its DMA capabilities can be queried through KHR.
@@ -356,6 +364,9 @@ AmlyGpu *amly_gpu_new(GError **error)
     }
     return gpu;
 }
+
+AmlyGpu *amly_gpu_new(GError **error) { return new_converter(FALSE, error); }
+AmlyGpu *amly_gpu_new_tonemap(GError **error) { return new_converter(TRUE, error); }
 
 static void release_import(AmlyGpu *gpu, ImportedBuffer *buffer)
 {
@@ -497,7 +508,7 @@ static gboolean record_commands(AmlyGpu *gpu, ImportedBuffer *input,
     if (result != VK_SUCCESS)
         return fail(error, "vkBeginCommandBuffer", result);
     buffer_barriers(gpu, input, output, TRUE);
-    if (params->width != params->input_width || params->height != params->input_height) {
+    if (!gpu->tonemap && (params->width != params->input_width || params->height != params->input_height)) {
         amly_gpu_scaler_record(gpu->scaler, gpu->command, input->buffer, input_range,
             output->buffer, output_range, params->width, params->height,
             params->input_stride, params->output_stride_words, params->output_luma_rows);
@@ -507,7 +518,8 @@ static gboolean record_commands(AmlyGpu *gpu, ImportedBuffer *input,
             gpu->pipeline_layout, 0, 1, &gpu->descriptor_set, 0, NULL);
         vkCmdPushConstants(gpu->command, gpu->pipeline_layout,
             VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(*params), params);
-        vkCmdDispatch(gpu->command, (params->width / 2 + 63) / 64, params->height / 2, 1);
+        guint columns = gpu->tonemap ? (params->width + 3) / 4 : params->width / 2;
+        vkCmdDispatch(gpu->command, (columns + 63) / 64, params->height / 2, 1);
     }
     buffer_barriers(gpu, input, output, FALSE);
     result = vkEndCommandBuffer(gpu->command);
@@ -547,11 +559,12 @@ gboolean amly_gpu_convert_padded(AmlyGpu *gpu, int input_fd, gsize input_size,
         !input_width || !input_height || (input_width & 1) || (input_height & 1) ||
         width > input_width || height > input_height || output_luma_rows < height ||
         (output_luma_rows & 1) ||
-        (guint64)input_stride < (guint64)input_width * 5 / 2 ||
-        (guint64)output_stride_bytes < (guint64)width * 2 ||
+        (guint64)input_stride < (gpu->tonemap ? (guint64)input_width * 2 : (guint64)input_width * 5 / 2) ||
+        (guint64)output_stride_bytes < (guint64)width * (gpu->tonemap ? 1 : 2) ||
         output_stride_bytes % 16)
         return invalid(error, "AMLY conversion requires distinct DMA fds, even geometry and valid pitches");
-    guint64 input_range = ((guint64)input_stride * input_height + 3) & ~(guint64)3;
+    guint64 input_range = gpu->tonemap ? (guint64)input_stride * gpu->input_luma_rows * 3 / 2 :
+        ((guint64)input_stride * input_height + 3) & ~(guint64)3;
     guint64 output_luma_size = (guint64)output_stride_bytes * output_luma_rows;
     if (input_range > G_MAXUINT32 || output_luma_size > G_MAXUINT32)
         return invalid(error, "AMLY shader byte offsets exceed 32-bit addressing");
@@ -567,7 +580,7 @@ gboolean amly_gpu_convert_padded(AmlyGpu *gpu, int input_fd, gsize input_size,
 
     ImportedBuffer input = {0}, output = {0};
     gboolean ok = FALSE;
-    if (width != input_width || height != input_height) {
+    if (!gpu->tonemap && (width != input_width || height != input_height)) {
         if (gpu->scaler && (gpu->scale_input_width != input_width || gpu->scale_input_height != input_height)) {
             amly_gpu_scaler_free(gpu->scaler);
             gpu->scaler = NULL;
@@ -588,7 +601,8 @@ gboolean amly_gpu_convert_padded(AmlyGpu *gpu, int input_fd, gsize input_size,
     if (gpu->timing)
         t1 = g_get_monotonic_time();
     ConvertParams params = {width, height, input_stride, output_stride_bytes / 4,
-                            input_width, input_height, output_luma_rows};
+                            input_width, input_height, output_luma_rows,
+                            gpu->input_luma_rows, gpu->white, gpu->peak, gpu->shoulder};
     if (!record_commands(gpu, &input, &output, input_range, output_range,
                            &params, error))
         goto cleanup;
@@ -647,6 +661,28 @@ cleanup:
                 gpu->free_us / gpu->frames / 1000.0);
     }
     return ok;
+}
+
+gboolean amly_gpu_tonemap(AmlyGpu *gpu, int input_fd, gsize input_size,
+                         int output_fd, gsize output_size, guint width, guint height,
+                         guint input_stride, guint input_luma_rows, guint output_stride,
+                         float white, float peak, GError **error)
+{
+    if (!gpu || !gpu->tonemap || input_luma_rows < height || (input_luma_rows & 1) ||
+        input_stride % 4 || !(white >= 160 && white <= 1000 && peak > white && peak <= 10000))
+        return invalid(error, "Invalid P010 tone-map storage or white/peak");
+    gpu->input_luma_rows = input_luma_rows; gpu->white = white; gpu->peak = peak;
+    double knee = pow((.9 + .055) / 1.055, 2.4), span = peak / white - knee;
+    double slope = 1.055 / (2.4 * pow((.9 + .055) / 1.055, 1.4)), lo = 0, hi = 1;
+    while (.1 * hi / log1p(hi * span) < slope) hi *= 2;
+    for (guint i = 0; i < 64; i++) {
+        double mid = (lo + hi) * .5;
+        if (.1 * mid / log1p(mid * span) < slope) lo = mid;
+        else hi = mid;
+    }
+    gpu->shoulder = (lo + hi) * .5;
+    return amly_gpu_convert_padded(gpu, input_fd, input_size, output_fd, output_size,
+        width, height, width, height, input_stride, output_stride, height, error);
 }
 
 void amly_gpu_free(AmlyGpu *gpu)

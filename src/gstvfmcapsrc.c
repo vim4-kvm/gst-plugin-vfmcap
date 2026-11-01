@@ -861,6 +861,11 @@ gst_vfmcap_src_init(GstVfmCapSrc *self)
 static gboolean
 plugin_init(GstPlugin *plugin)
 {
+#ifdef HAVE_AMLY_GPU
+	extern GType gst_vim4_pq2sdr_get_type(void);
+	if (!gst_element_register(plugin, "vim4pq2sdr", GST_RANK_NONE, gst_vim4_pq2sdr_get_type()))
+		return FALSE;
+#endif
 #ifdef HAVE_VIM4_AMLY_SOURCE
 	extern GType gst_vim4_amly_src_get_type(void);
 	if (!gst_element_register(plugin, "vim4amlysrc", GST_RANK_NONE,

@@ -110,6 +110,15 @@ static gboolean start(GstBaseSrc *base)
         goto failed;
     guint width = self->output_width ? self->output_width : self->width;
     guint height = self->output_height ? self->output_height : self->height;
+    /* Applications specify an output-height ceiling; explicit width/height
+     * pairs (One-KVM) retain their existing exact geometry contract. */
+    if (!self->output_width && self->output_height) {
+        height = MIN(height, self->height);
+        width = MAX(2u, ((guint64)self->width * height / self->height) & ~1u);
+    } else if (self->output_width && !self->output_height) {
+        width = MIN(width, self->width);
+        height = MAX(2u, ((guint64)self->height * width / self->width) & ~1u);
+    }
     if (width > self->width || height > self->height || (width & 1) || (height & 1))
         goto failed;
     gst_video_info_set_format(&self->output, GST_VIDEO_FORMAT_P010_10LE, width, height);
