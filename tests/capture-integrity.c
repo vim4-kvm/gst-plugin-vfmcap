@@ -1,13 +1,14 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 /* Exclusive board test with capture-pattern.swift on the physical 4K input.
- * Usage: capture-integrity /dev/video_cap FRAME_COUNT [last-frame.raw]
- * Measures source -> appsink, including full-frame repacking. No encoding.
+ * Usage: capture-integrity [--v4l2] DEVICE FRAME_COUNT [last-frame.raw]
+ * Measures source -> appsink. --v4l2 uses native YUV24 without repacking.
  */
 #include <gst/app/gstappsink.h>
 #include <gst/video/video.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 static uint32_t marker(const guint8 *data, gint stride, guint y)
 {
@@ -30,6 +31,11 @@ static gboolean same_color(const guint8 *a, const guint8 *b)
 int main(int argc, char **argv)
 {
 	gst_init(&argc, &argv);
+	gboolean v4l2 = argc > 1 && !strcmp(argv[1], "--v4l2");
+	if (v4l2) {
+		argc--;
+		argv++;
+	}
 	if (argc < 3 || argc > 4)
 		return 2;
 	guint count = atoi(argv[2]);
@@ -37,8 +43,10 @@ int main(int argc, char **argv)
 		return 2;
 	GError *error = NULL;
 	GstElement *pipeline = gst_parse_launch(
-		"vfmcapsrc name=source ! video/x-raw,format=v308 ! "
-		"appsink name=sink sync=false max-buffers=2 drop=false", &error);
+		v4l2 ? "v4l2src name=source io-mode=mmap ! video/x-raw,format=v308 ! "
+		       "appsink name=sink sync=false max-buffers=2 drop=false" :
+		       "vfmcapsrc name=source ! video/x-raw,format=v308 ! "
+		       "appsink name=sink sync=false max-buffers=2 drop=false", &error);
 	if (error) {
 		g_printerr("%s\n", error->message);
 		g_error_free(error);
@@ -64,6 +72,15 @@ int main(int argc, char **argv)
 		GstSample *sample = gst_app_sink_try_pull_sample(GST_APP_SINK(sink), 3 * GST_SECOND);
 		if (!sample) {
 			g_printerr("No frame at %u\n", frames);
+			GstBus *bus = gst_element_get_bus(pipeline);
+			GstMessage *message = gst_bus_pop_filtered(bus, GST_MESSAGE_ERROR);
+			if (message) {
+				gst_message_parse_error(message, &error, NULL);
+				g_printerr("%s\n", error->message);
+				g_clear_error(&error);
+				gst_message_unref(message);
+			}
+			gst_object_unref(bus);
 			failed = TRUE;
 			break;
 		}

@@ -231,6 +231,25 @@ For temporary diagnostics, set `VIM4_VIDEO_TIMING=1 GST_DEBUG=vfmcapsrc:4`.
 exposure or scanout latency. `sequence` is the consumer's delivery sequence.
 Disabled by default; remove these variables after measuring to avoid logging overhead.
 
+## Standard V4L2 raw 444 verification
+
+For the 7.3 T7 native YUV24 candidate, use the existing system `v4l2src`.
+Deploy the private GStreamer recipe's `gstreamer-v4l2-yuv24.patch` as well.
+It adds `YUV3`/`v308` negotiation to 1.24.2 without a custom source element or
+conversion. The driver requires an actual SDR YCbCr444 eight-bit HDMI input.
+Unsupported input or a kernel without YUV24 fails explicitly.
+
+```sh
+build/capture-integrity --v4l2 /dev/video0 3600 /tmp/last-yuv444.raw
+```
+
+Choose the T7 capture node using QUERYCAP. Run the existing physical 4K
+`tests/capture-pattern.swift` fixture on the source under exclusive board
+ownership. This mode maps complete frames and samples their markers/chroma,
+then copies only the optional final frame. Its timing measures delivery to
+appsink, rather than a full CPU copy of every frame. The default invocation
+continues to exercise the vendor `vfmcapsrc` capture/repacking path.
+
 ## License
 
 [LGPL-2.1-or-later](LICENSE), matching the GStreamer plugin declaration.
