@@ -1,255 +1,131 @@
 # gst-plugin-vfmcap
 
-GStreamer source `vfmcapsrc` for the `vfm_cap` V4L2 device ([vim4-kvm/common_drivers](https://github.com/vim4-kvm/common_drivers) `drivers/media/vfm_cap`).
-
-Eight-bit frames are exported as DMA-buf straight from the vdin capture buffers
-and pushed downstream without copies. Packed ten-bit input uses Mali Vulkan
-conversion to contiguous P010 DMA buffers for the separate Main10 encoder,
-with the verified CPU converter as a startup fallback.
-
-## Native HDR capture on the experimental V4L2 backend
-
-When built with the exported `linux/amlogic-vdin.h` UAPI header and Vulkan,
-`vim4amlysrc` negotiates the private **AMLY** format with the T7 capture driver.
-AMLY remains packed 4:2:2 ten-bit input; the source publishes P010 only after
-the Vulkan converter has completed. It never maps pixels or falls back to CPU.
-The existing `vfmcapsrc` behavior on 5.15 remains available separately.
-
-The capture queue owns four exported DMA buffers. Each frame is requeued only
-after its GPU fence has completed. Three separate contiguous P010 buffers form
-the downstream pool; flush wakes pool acquisition and capture polling. A GPU
-failure ends the stream. `width=0 height=0` keeps native dimensions; explicit
-even dimensions request GPU downscaling and cannot exceed the source.
-VideoMeta carries the actual pitch, UV offset and storage padding. Wave5 output
-storage uses 32-pixel rows and a 16-row luma height, independently of visible
-geometry. Buffer size covers that storage and allocation capacity also includes
-page rounding.
-
-Both kernels use the same shader sources: `src/amly-to-p010.comp`, with
-`src/amly-to-texture.comp` and `src/texture-to-p010.comp` for scaling. Vulkan 1.1
-uses core external-memory queries; Vulkan 1.0 requires the equivalent KHR
-instance/device extensions. Missing DMA-buf capabilities fail explicitly, and
-software devices are rejected. These checks establish API requirements, not
-hardware acceptance on both kbase and Panfrost.
-
-Export only the new UAPI header into a private include directory, then pass its
-parent as `CFLAGS=-I/path/to/private-uapi` when configuring Meson. Without the
-header this source is not built or registered. Private standard video4linux2
-also needs the companion P010 mapping patch. The source returns PQ/BT.2020
-limited-range data; the consumer must read current HDR10 metadata from the
-capture node's standard compound controls and insert static SEI as appropriate.
-Do not interpret this stream as an SDR JPEG source.
-
-### SDR branch candidate
-
-`vim4pq2sdr` accepts the native source's single-fd, padded P010 VideoMeta and
-produces separate NV12 DMA buffers using Vulkan. It uses the same external
-memory/fence ownership as AMLY conversion, with a bounded two-buffer output
-pool. NV12/BT.709 input passes through; PQ with another format, range or
-primaries is rejected. There is no CPU pixel conversion or upload fallback.
-It reads the global `HDR_SDR_WHITE`/`HDR_SDR_PEAK` preferences once per second;
-explicit `sdr-white`/`hdr-peak` properties override those values. The edge
-logarithmic highlight curve preserves the sRGB midtones, with a BT.2020-to-709
-gamut conversion and limited-range NV12 output for JPEG/video conversion.
-
-The live Main10 encoder continues to receive the original P010. Screenshots
-open a valve on this same capture only for one fresh frame, then tone map it
-before ordinary SDR JPEG scaling/compression. Continuous JPEG consumers use a
-leaky one-frame raw queue. Neither path opens VDIN again. A GPU failure ends
-the affected pipeline; no incomplete output is handed back to consumers.
-CPU JPEG conversion maps only the resulting SDR buffer via the standard
-[GStreamer DMA-buf allocator](https://github.com/GStreamer/gstreamer/blob/1.24.2/subprojects/gst-plugins-base/gst-libs/gst/allocators/gstdmabuf.c),
-which issues CPU-access synchronization on map/unmap.
-
-For offline arithmetic checks, build `pq-sdr-probe`, explicitly select a
-software Vulkan ICD and run `python3 tests/pq-sdr-compare.py build OUTPUT`.
-It compares the actual SPIR-V to a double-precision reference, checks poisoned
-row padding and padded UV offsets, and saves fixtures/results. It does not
-qualify board DMA import, cache ownership or either GPU stack's throughput.
-Meson also tests negotiation, global-curve changes and failed-start cleanup
-without a GPU. Native source height-only requests preserve aspect ratio and
-never upscale; explicit dimension pairs retain the exact geometry contract.
-
-## Existing 5.15 capture and scaling
-
-The same plugin provides `vim4vdin1src` for the native-HDR 5.15 runtime:
-VDIN0 retains the display's HDR stream while VDIN1 captures independent NV21 SDR
-from the same HDMI receiver. The board launcher sets `VIM4_SECONDARY_HDMI_CAPTURE=1`
-and selects the private **standard** `video4linux2` plugin; the system vendor
-replacement must not be used because it closes the primary HDMI receiver.
-`vim4vdin1src` reads HDMI geometry on startup, exports DMA buffers with VideoMeta,
-and reserves enough buffers for concurrent encoder/JPEG branches. `height=0`
-keeps the input size; a smaller height requests VDIN1 hardware scaling, preserving
-aspect ratio. `num-buffers` supports one-frame snapshots. It refuses to start
-without the explicit runtime flag: stock `/dev/video71` is display writeback.
-
-The allocation query requests two downstream slots. The matched standard V4L2
-plugin adds four, giving six physical buffers (about 71 MiB at 4K NV21).
-Use bounded one-frame raw queues for encoder/JPEG branches. Asking for six slots
-in the query instead allocates ten physical buffers and can prevent recovery
-after HDMI pool reallocation, despite ample total free CMA.
-
-On receivers exposing `Capture Frame Rate`, VDIN1 caps use that stable base
-budget during VRR; the measured `Frame Rate` remains the fallback for older
-kernels. An explicitly unknown base rate is rejected. This does not pace or
-duplicate frames, advertise VRR through EDID, or qualify hardware VRR support.
-
-With the Amlogic `libge2d` development library, this plugin also builds
-`vim4scale`: a DMA-only NV12/NV21 → NV12 SDR downscaler. `height=0` preserves
-native dimensions; smaller even heights preserve aspect ratio. The optional
-`width-alignment=16` satisfies the vendor HEVC encoder; H.264 uses the default 2.
-Alternatively, fix the output dimensions with raw-video caps. It never upscales.
-Visible width and actual VideoMeta row pitch are separate GE2D parameters,
-so a 3440-pixel image in 3456-byte rows is scaled without shearing or CPU copies.
-Input must be one contiguous DMA allocation, with equal 64-byte-aligned Y/UV
-pitches and UV immediately after the Y rows. The board launcher selects this
-V4L2 layout on 5.15 (`GST_V4L2_PREFER_CONTIGUOUS=1`); 7.3 keeps separate plane views.
-Native-size negotiation preserves the input format and DMA buffer without a blit
-or output pool. Scaled output uses three bounded codecmm slots, a 64-byte pitch
-and explicit VideoMeta.
-Submission completes synchronously before releasing the input. Flush and stop
-wake blocked output acquisitions; retained outputs own their DMA fds until release.
-
-`sdr-scale-compare --exclusive` is an idle-board diagnostic, not an automatic
-test: it checks poisonous input padding, visible luma, NV21→NV12 chroma, PTS and
-repeated processing for 3440×1440→1720/1712×720. Its throughput is GE2D-only;
-measure capture, encoding and browser playback separately.
+This page covers VIM4 capture ownership, DMA conversion and hardware diagnostic limits.
+Current rule: share one capture owner, preserve VideoMeta, and deploy matched driver/plugin/runtime components.
+Read [build](#build), [vendor capture](#existing-515-capture-and-scaling),
+[packed HDR](#packed-hdr-conversion), [mainline HDR](#native-hdr-capture-on-the-experimental-v4l2-backend),
+[SDR branch](#sdr-branch-candidate), or [validation](#hardware-regression).
+Properties, layouts and pool counts are authoritative in the linked source/class_init, not repeated here.
 
 ## Build
 
-```sh
-sudo apt install libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev meson pkg-config libvulkan-dev glslang-tools
-meson setup build --buildtype=release --prefix=/usr && ninja -C build && meson test -C build && sudo ninja -C build install
-```
+Dependencies, optional UAPI/Vulkan/GE2D support and offline targets live in [meson.build](meson.build).
+Configure a release build, then build, run Meson tests and install.
+For the experimental source, export only the companion AMLY UAPI header into a private include tree;
+pass that tree to the compiler. Without the header the factory is not registered.
+The private standard V4L2 plugin needs the workspace mapping patches; the vendor replacement closes the primary RX.
+Production dependencies and installation belong to the workspace
+[package recipe](https://github.com/vim4-kvm/vim4-kvm/blob/main/packaging/ubuntu/package.py).
+Runtime properties can be inspected with gst-inspect-1.0 after selecting the candidate plugin.
 
-## Use
+## Existing 5.15 capture and scaling
 
-vdin0 must write NV21/NV12/UYVY, YUV444 or packed ten-bit `AMLY`, and `vfm_cap`
-must be in the vfm `tvpath` after `vdin0`. See the `vim4-kvm` repo `tools/hdmi-setup.sh`.
+[vfmcapsrc](src/gstvfmcapsrc.c) exports eight-bit frames as DMA-buf without copying.
+The board [HDMI setup](https://github.com/vim4-kvm/vim4-kvm/blob/main/tools/hdmi-setup.sh)
+owns capture format and vfm routing. Capture support alone does not imply encoder support.
 
-The native-HDR T7 configuration uses full-packed 4:2:2 and `no_swap_en=1`.
-`AMLY` conversion unpacks little-endian Cb-Y-Cr-Y ten-bit slots (five bytes per pair),
-then vertically averages chroma into P010. The Vulkan backend requires a real
-Mali-G52, external-memory DMA imports and the matching userspace driver. Select
-its private ICD before starting GStreamer; the board One-KVM launcher does so
-on 5.15. No global graphics-library links are changed. Two fixed codecmm slots
-are allocated before the encoder's workspace; there is no unbounded CMA growth.
-Each GPU job completes and releases its temporary imports before returning the
-captured frame. The encoder must retain the output until its SDK reports input
-retirement. This two-slot budget requires the current low-delay encoder SDK,
-which retires the submitted DMA input on each completed call. Pool flushing
-wakes a source blocked waiting for an output slot.
+[VDIN1 source](src/gstvim4vdin1src.c) supplies independent SDR while VDIN0 retains HDR display.
+It requires the explicit runtime enable flag: stock VDIN1 is display writeback, not isolated HDMI capture.
+Use the matched standard V4L2 plugin and VideoMeta. Allocation-query slots are added to the plugin's own slots;
+copying a physical pool count into that query previously over-allocated CMA and prevented input recovery.
+Keep raw branch queues bounded. Stable capture base rate is used where available; unknown is rejected,
+older kernels retain measured-rate fallback. This does not pace frames, advertise EDID VRR or qualify hardware VRR.
 
-For packed ten-bit input, `vfmcapsrc height=1700` requests a smaller even height
-and derives an even width preserving the input aspect ratio (4K becomes
-3022×1700). Zero or a height at least as large as the input keeps native size.
-Scaling requires Mali and contiguous output buffers; it fails explicitly when
-unavailable. Native-size conversion retains its CPU fallback.
-The scaler unpacks into two fixed GPU-private R16F/RG16F textures, retaining
-4:2:2 chroma until bilinear resizing and 4:2:0 subsampling. Binary16 represents
-all ten-bit integer samples exactly. Texture interpolation has finite subtexel
-precision; it does not apply a tone curve or change PQ/BT.2020. The final P010
-surface uses the same bounded DMA pool and encoder retirement contract.
+[GE2D scaler](src/gstvim4scale.c) handles SDR DMA downscaling.
+Visible width and actual row pitch are independent; conflating them shears padded ultrawide input.
+The validated contiguous-plane contract is mandatory, with native-size passthrough avoiding a blit/pool.
+The common launcher selects the matching vendor layout; mainline retains separate plane views.
+GPU/GE2D work must finish before input release. Flush/stop wakes blocked acquisitions,
+and outstanding output owns its fd until release. Do not upscale.
 
-When Vulkan or contiguous allocation is unavailable at startup, CPU conversion
-uses reusable system-memory buffers. `gpu-conversion=false` forces that path for
-comparisons. A GPU error after submission fails the stream instead of returning
-potentially incomplete pixels. ARM64 NEON processes complete 32-pixel blocks;
-the scalar tail preserves padded rows. CPU access requires cacheable read-only
-DMA mappings and DMA-BUF synchronization. Neither path applies a tone curve. Caps retain
-PQ/BT.2020 from the driver's V4L2 colorimetry; use the runtime GStreamer color
-parser because vendor and standard transfer-enum numeric values differ.
-HLG, twelve-bit and non-full-packed input have not been qualified.
+YUV444 capture uses the driver's extension and byte ordering, then
+[VUY repacking](src/vuy24.h) preserves full chroma in standard system-memory output.
+This copies every frame. Cacheable read-only mapping plus DMA-BUF synchronization is required;
+the older write-combine mapping is functionally valid but too slow for full-frame processing.
+Fuse copy/reorder and reuse output instead of adding repeated full-frame reads.
+Runtime color parsing is necessary because vendor and standard enum numbers differ.
+Keep existing applications on their supported format until the complete encoder path supports full chroma.
+A diagnostic format change affects every consumer and needs HDMI service restart;
+restore the normal capture configuration before restarting KVM applications.
 
-`amly-gpu-compare` is an exclusive hardware diagnostic, not an automatic test.
-Its default suite compares synthetic extreme/random samples, workgroup/NEON
-boundaries, unusual pitches, padding, 1440p/ultrawide and 4K byte-for-byte with
-the CPU converter. For an actual captured frame, including optional page padding:
+## Packed HDR conversion
 
-```sh
-VK_ICD_FILENAMES=/usr/lib/vim4-kvm/gpu/mali.json build/amly-gpu-compare --raw capture.amly 3840 2160 9600 7680 3
-VK_ICD_FILENAMES=/usr/lib/vim4-kvm/gpu/mali.json build/amly-gpu-compare --scale 3840 2160 3022 1700 120
-```
+[AMLY unpacking](src/amly.h), [GPU conversion](src/amly-gpu.c) and
+[GPU scaling](src/amly-gpu-scale.c) preserve ten-bit PQ samples.
+Use the board launcher's private matching Mali ICD, without global graphics-library symlinks.
+Full-packed input and byte-order configuration must match the driver; HLG, twelve-bit and other packing are unqualified.
+Scaling preserves aspect ratio and requires Mali with contiguous output; missing support fails explicitly.
+Native-size startup can fall back to reusable CPU buffers, but a GPU error after submission must fail the stream,
+never return potentially incomplete pixels. CPU SIMD handles complete blocks with a scalar padded-row tail.
 
-This replays the same frame and checks visible samples and padding on the first
-and final dispatch. Native conversion remains byte-exact. Scaled output is
-compared with an independent double-precision bilinear reference (maximum six
-ten-bit code values for the qualified Mali texture filter), with zero low P010
-bits and unchanged padding. The default suite includes clamped edges, unusual
-pitches, non-block-aligned dimensions, 4K downscales and ultrawide input. It does not
-measure capture/encode/browser throughput. `VIM4_VIDEO_TIMING=1` also reports
-GPU import, dispatch, fence wait, and import destruction/idle every120frames.
+Bounded output pools are allocated before encoder workspace and retained until SDK input retirement.
+This budget depends on the low-delay SDK retiring input on completed calls; an output packet alone is not a general
+retirement signal. Jobs finish and release temporary imports before capture requeue, and flushing wakes pool waits.
+Scaling keeps full chroma until interpolation/subsampling; it applies no tone curve.
+Binary16 represents ten-bit samples exactly, but texture filtering has finite subtexel precision.
+Keep pitch, padding and colorimetry distinct from visible dimensions.
 
-YUV444 requires the driver's `VUY3` extension and `no_swap_en=1`. VDIN writes
-Cr-Cb-Y bytes; the source reorders them into standard GStreamer `v308` (Y-Cb-Cr)
-system-memory buffers, preserving every chroma sample. This path copies each
-frame and uses ARM64 NEON when available; NV21/NV12/UYVY remain zero-copy.
-Use the driver with cacheable read-only DMA mappings and CPU access callbacks:
-cache invalidation runs once per immutable frame export, and the source fuses
-copying/reordering into reusable output buffers. The earlier write-combine
-mapping is functionally compatible but too slow for full-frame CPU processing.
-Capture support does not imply that `amlvenc` can encode 4:4:4. Keep NV21 for
-existing KVM applications until their complete encoding path supports 4:4:4.
+## Native HDR capture on the experimental V4L2 backend
 
-For an exclusive diagnostic pipeline, configure the board HDMI service with
-`HDMI_CAPTURE_FORMAT=YUV444`, then use:
+[vim4amlysrc](src/gstvim4amlysrc.c) negotiates packed AMLY, then publishes P010 only after GPU completion.
+It never maps pixels or falls back to CPU. Capture DMA is requeued only after its fence;
+separate bounded output storage remains owned downstream. Flush wakes pool waits and capture polling.
+VideoMeta carries padded pitch, UV offset and storage height, independent of visible geometry.
+Height-only downscaling preserves aspect ratio; explicit pairs use the exact geometry contract.
 
-```sh
-gst-launch-1.0 vfmcapsrc ! video/x-raw,format=v308 ! fakesink sync=false
-```
+The shared shaders are [unpack](src/amly-to-p010.comp),
+[texture input](src/amly-to-texture.comp) and [scaled output](src/texture-to-p010.comp).
+Real external-memory DMA capabilities are required; software devices are rejected.
+Core/extension availability checks establish API requirements, not acceptance on kbase and Panfrost.
+Consumers must read fresh standard HDR10 controls and insert metadata.
+Never treat PQ capture as an SDR JPEG source.
 
-The capture setting affects all consumers and requires restarting the HDMI
-service. Restore `HDMI_CAPTURE_FORMAT=NV21` before restarting existing KVM apps.
+## SDR branch candidate
+
+[vim4pq2sdr](src/gstvim4pq2sdr.c) uses the same fence/external-memory ownership to produce separate NV12 DMA.
+It accepts its validated padded P010 layout, passes compatible SDR through and rejects other PQ formats/colorimetry.
+There is no CPU pixel conversion/upload fallback. Global curve preferences can be overridden by explicit properties;
+shader arithmetic is in [p010-to-sdr.comp](src/p010-to-sdr.comp).
+Tone mapping preserves midtones while converting gamut/range for SDR.
+
+Main10 encoding keeps the original P010. Screenshots open a valve for one fresh shared frame,
+tone map, then use ordinary SDR scaling/JPEG; continuous JPEG uses a leaky bounded raw queue.
+Neither opens VDIN again. GPU failure terminates the affected pipeline.
+CPU JPEG maps only the final SDR DMA with standard GStreamer CPU-access synchronization.
+
+The offline [comparison](tests/pq-sdr-compare.py) runs actual SPIR-V on an explicitly selected software ICD,
+checks padded offsets/poisoned rows against a double-precision reference, and saves results.
+Meson covers negotiation, policy changes and failed-start cleanup.
+These checks do not qualify board DMA import, cache ownership or either GPU stack's throughput.
 
 ## Hardware regression
 
-Build `tests/capture-pattern.swift` with `swiftc` on the Mac supplying HDMI and
-run it on a physical 3840×2160 display with 1920×1080 HiDPI scaling. It displays
-dynamic frame IDs at three heights and single-pixel chroma stripes, then exits
-after 240 seconds. With exclusive board access and YUV444 configured, run the
-Meson-built `capture-integrity /dev/video_cap 3600 last-frame.raw`. After 120
-warm-up frames it checks every output frame for checksum failures, tearing,
-repeated/skipped IDs and horizontal/vertical chroma preservation. A failure
-returns nonzero; source/display cadence can also cause repeated/skipped IDs.
-This tests the complete capture/repack path to appsink, not encoding/network.
+All hardware diagnostics require exclusive idle-board ownership; they are not automatic tests.
+Options and fixture geometry live in the named test source or its help.
 
-```sh
-gst-launch-1.0 vfmcapsrc ! queue ! amlvenc bitrate=8000 ! video/x-h264 ! h264parse ! mp4mux ! filesink location=cap.mp4
-```
+- [AMLY comparison](tests/amly-gpu-compare.c): synthetic extremes/random data, boundaries, unusual pitches and real captured input.
+  Native conversion is byte-exact; scaled output uses a separate bilinear reference and checks low bits/padding.
+  Replaying one frame does not measure capture/encode/browser throughput.
+- [SDR scale comparison](tests/sdr-scale-compare.c): poisoned padding, visible luma/chroma, timestamps and reuse.
+  Its throughput is GE2D-only.
+- [Capture fixture](tests/capture-pattern.swift) and [integrity checker](tests/capture-integrity.c):
+  use a physical source display with the fixture's required scaling. Dynamic IDs and single-pixel chroma test
+  checksum, tearing, repeats/skips and chroma preservation. Source/display cadence can also cause repeats/skips.
+  This covers capture/repack to appsink, not encoding or network.
 
-| Property | Default | |
-|---|---|---|
-| `device` | `/dev/video_cap` | vfm_cap device node |
-| `gpu-conversion` | `true` | Try Mali conversion for packed ten-bit; startup failures fall back to CPU |
-| `height` | `0` | Maximum packed ten-bit output height; smaller values must be even and require GPU scaling |
+For standard raw 444, select the node using QUERYCAP and use the checker's V4L2 mode with the private YUV24 patch.
+It requires real SDR YCbCr444 input; unsupported input/kernel fails explicitly.
+That mode samples mapped complete frames and copies only an optional final frame, so timing is not a full CPU copy.
+Vendor mode retains full repack coverage.
 
-On a source change (resolution/format) the element renegotiates caps. Timestamps are taken from the pipeline clock at dequeue time; caps carry `framerate=0/1` since the rate follows the HDMI source.
-
-For temporary diagnostics, set `VIM4_VIDEO_TIMING=1 GST_DEBUG=vfmcapsrc:4`.
-`delivery_to_dequeue_ms` compares the kernel's V4L2 delivery timestamp with
-`CLOCK_MONOTONIC` immediately after DQBUF. It measures pending delivery, not HDMI
-exposure or scanout latency. `sequence` is the consumer's delivery sequence.
-Disabled by default; remove these variables after measuring to avoid logging overhead.
-
-## Standard V4L2 raw 444 verification
-
-For the 7.3 T7 native YUV24 candidate, use the existing system `v4l2src`.
-Deploy the private GStreamer recipe's `gstreamer-v4l2-yuv24.patch` as well.
-It adds `YUV3`/`v308` negotiation to 1.24.2 without a custom source element or
-conversion. The driver requires an actual SDR YCbCr444 eight-bit HDMI input.
-Unsupported input or a kernel without YUV24 fails explicitly.
-
-```sh
-build/capture-integrity --v4l2 /dev/video0 3600 /tmp/last-yuv444.raw
-```
-
-Choose the T7 capture node using QUERYCAP. Run the existing physical 4K
-`tests/capture-pattern.swift` fixture on the source under exclusive board
-ownership. This mode maps complete frames and samples their markers/chroma,
-then copies only the optional final frame. Its timing measures delivery to
-appsink, rather than a full CPU copy of every frame. The default invocation
-continues to exercise the vendor `vfmcapsrc` capture/repacking path.
+Timestamp, variable-rate caps and renegotiation behavior live in [vfmcapsrc](src/gstvfmcapsrc.c).
+Delivery timing compares kernel delivery with dequeue, not HDMI exposure or display scanout;
+the delivery sequence is not proof of a source frame counter.
+Temporary timing/debug variables add overhead and must be removed after measurement.
+Historical evidence is in the workspace
+[bringup index](https://github.com/vim4-kvm/vim4-kvm/blob/main/docs/bringup/README.md).
+Both GPU stacks, native HDR viewers and hardware VRR require their own board acceptance.
 
 ## License
 
-[LGPL-2.1-or-later](LICENSE), matching the GStreamer plugin declaration.
+[LGPL-2.1-or-later](LICENSE), matching the plugin declaration.
